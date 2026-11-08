@@ -92,7 +92,7 @@ The PS/2 controller performs its original key scanning. The ESP32 receives trans
 
 **Electrical warning:** This particular HP keyboard is nominally a **5 V PS/2 device**, but it has been operated experimentally at **3.3 V**. The ESP32-C3 GPIOs are **not 5 V tolerant**. Do not assume a different keyboard can be connected this way; a normal 5 V PS/2 setup needs suitable level adaptation and proper pull-up verification. Never determine pinout from wire color alone.
 
-<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/5a1e70cc-24c7-4695-84b5-74f0a7e7b6ff" />
+<img width="300" height="300" alt="image" src="https://github.com/user-attachments/assets/5a1e70cc-24c7-4695-84b5-74f0a7e7b6ff" />
 
 ### The original key matrix stays untouched
 
