@@ -57,6 +57,9 @@ This is **not** a direct-wire matrix conversion: the original keyboard electroni
 
 ### PS/2 signal wiring (current build)
 
+
+<img width="676" height="522" alt="image" src="https://github.com/user-attachments/assets/766edf7e-328a-48be-a72c-deb1237013c7" />
+
 | PS/2 signal | ESP32-C3 SuperMini |
 | --- | --- |
 | DATA | **GPIO4** |
