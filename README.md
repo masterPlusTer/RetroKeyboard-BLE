@@ -92,21 +92,23 @@ The PS/2 controller performs its original key scanning. The ESP32 receives trans
 
 **Electrical warning:** This particular HP keyboard is nominally a **5 V PS/2 device**, but it has been operated experimentally at **3.3 V**. The ESP32-C3 GPIOs are **not 5 V tolerant**. Do not assume a different keyboard can be connected this way; a normal 5 V PS/2 setup needs suitable level adaptation and proper pull-up verification. Never determine pinout from wire color alone.
 
-![ESP32-C3 wiring detail](images/esp32-wiring-closeup.jpg)
+<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/5a1e70cc-24c7-4695-84b5-74f0a7e7b6ff" />
 
 ### The original key matrix stays untouched
 
 The original membrane and controller are still in use. No replacement matrix-scanning firmware was required.
 
-![Original keyboard membrane](images/membrane-and-controller.jpg)
+<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/bf146ddd-a62b-48f3-a6e4-5b18b995a2f4" />
 
 ## Internal battery prototype
 
 The battery, IP5306 board, and ESP32-C3 were fitted into existing space near the top of the HP enclosure. This keeps the standard keyboard layout and key matrix intact.
 
-![Electronics inside original enclosure](images/internal-layout.jpg)
+<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/61d538f5-ac41-418a-94a5-cd6401eb4525" />
+<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/119dc95e-7bf6-4fe7-84c2-029c40c7121b" />
+<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/a14bc7c6-4fb9-4401-b6bb-681a6f3c55d8" />
 
-![Battery and IP5306 power board](images/battery-power-module.jpg)
+
 
 ### Current power chain
 
@@ -251,39 +253,18 @@ Monitor speed: **115200 baud**. USB CDC On Boot should be enabled when compiling
 
 The HID gap returns to **8 ms** after reboot in `v1.ino`. Serial statistics are volatile and reset on reboot unless separately recorded.
 
-## Photo gallery
 
-All images below are photographs of the **actual prototype**. The Markdown image paths are relative to this repository's `images/` folder.
-
-### Finished keyboard and exterior access
-
-![HP KB-9970 converted keyboard](images/keyboard-exterior.jpg)
-
-![Side opening and exterior cable access](images/exterior-port.jpg)
-
-### Open keyboard: final prototype layout
-
-![Internal layout showing cell, IP5306 and ESP32](images/internal-layout.jpg)
-
-![Close-up of the installed power board and ESP32](images/battery-power-module.jpg)
-
-![ESP32 connections](images/esp32-wiring-closeup.jpg)
-
-### Original controller and keyboard membranes
-
-![Original LED/controller board](images/original-led-controller.jpg)
-
-![Membrane and original controller](images/membrane-and-controller.jpg)
-
-![Membrane circuit layers](images/membrane-layers.jpg)
 
 ### Power and components
 
-![IP5306 power module front](images/ip5306-front.jpg)
+![IP5306 power module front](<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/0f9f7cfd-5b68-45e1-8ca0-baa77ddde10a" />
+)
 
-![IP5306 power module rear](images/ip5306-back.jpg)
+![IP5306 power module rear](<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/62fd94be-f712-4638-9296-8a2c22c115ed" />
+)
 
-![Blue 14500 cell label 500mAh](images/14500-500mah-cell.jpg)
+![Blue 14500 cell label 500mAh](<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/6eb2c679-b43f-427c-a4d5-1ec7105e4031" />
+)
 
 ## Compatibility, limitations, and safety
 
@@ -329,4 +310,4 @@ A keyboard with a functioning key mechanism, a perfectly usable key matrix and a
 **Prototype:** HP KB-9970 + ESP32-C3 SuperMini + experimental 1S Li-ion/IP5306 power source.  
 **Initial public firmware:** `v1.ino` (8 ms HID + watchdog + experimental CPU keep-alive).  
 **Last README update:** 8 November 2026.  
-**License:** To be decided by the project author.
+
