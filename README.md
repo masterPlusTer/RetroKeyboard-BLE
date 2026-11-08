@@ -1,4 +1,5 @@
 # HP KB-9970 PS/2 to Bluetooth LE Keyboard
+<img width="1095" height="884" alt="image" src="https://github.com/user-attachments/assets/c6454d98-440d-4d47-b16b-7161415410f9" />
 
 **Give a classic PS/2 keyboard a second life with an ESP32-C3 SuperMini.**
 
