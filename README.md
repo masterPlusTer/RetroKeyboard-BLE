@@ -2,7 +2,9 @@
 
 **Giving a classic HP PS/2 keyboard a second life with an ESP32-C3 SuperMini, Bluetooth Low Energy, its original lock LEDs, and an experimental internal battery.**
 
-![HP KB-9970 keyboard after conversion](images/keyboard-exterior.jpg)
+<img width="1536" height="1152" alt="image" src="https://github.com/user-attachments/assets/1c2c2678-5f9e-4fd2-8860-884a8c3b0e68" />
+<img width="1152" height="1536" alt="image" src="https://github.com/user-attachments/assets/0c14edef-fe18-4188-a11f-4858b8b4b23d" />
+
 
 > **Project status (November 2026):** Initial public release: **`v1.ino`**. The keyboard works over Bluetooth, including Windows lock LEDs, with an experimental internal battery and a CPU-based power-bank keep-alive. This is a working prototype, not yet a finished or endurance-tested device.
 
