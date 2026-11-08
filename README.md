@@ -257,14 +257,14 @@ The HID gap returns to **8 ms** after reboot in `v1.ino`. Serial statistics are 
 
 ### Power and components
 
-![IP5306 power module front](<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/0f9f7cfd-5b68-45e1-8ca0-baa77ddde10a" />
+IP5306 power module front <img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/0f9f7cfd-5b68-45e1-8ca0-baa77ddde10a" />
 )
 
-![IP5306 power module rear](<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/62fd94be-f712-4638-9296-8a2c22c115ed" />
-)
+IP5306 power module rear <img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/62fd94be-f712-4638-9296-8a2c22c115ed" />
+ 
 
-![Blue 14500 cell label 500mAh](<img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/6eb2c679-b43f-427c-a4d5-1ec7105e4031" />
-)
+Blue 14500 cell label 500mAh <img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/6eb2c679-b43f-427c-a4d5-1ec7105e4031" />
+
 
 ## Compatibility, limitations, and safety
 
