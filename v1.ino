@@ -2,181 +2,216 @@
 #include <Arduino.h>
 #include <HijelHID_BLEKeyboard.h>
 
-// =====================================================
-// HP KB-9970 -> ESP32-C3 SuperMini -> Bluetooth HID
+// ===================================================
+// HP KB-9970 Bluetooth V4.1
+// ESP32-C3 SuperMini
 //
-// Bibliotecas:
-// NimBLE-Arduino 2.5.2
-// HijelHID_BLEKeyboard 0.6.0
+// PS/2 DATA  = GPIO4
+// PS/2 CLOCK = GPIO3
 //
-// DATA  = GPIO4
-// CLOCK = GPIO3
-// GND comun
+// NimBLE-Arduino 2.x
+// HijelHID_BLEKeyboard 0.6.x
 //
-// Alimentacion experimental del HP: 3.3 V
-// Su alimentacion nominal es 5 V.
-// =====================================================
+// Alimentacion actual del HP: 3.3 V experimental
+// Alimentacion nominal del HP: 5 V
+// ===================================================
 
 constexpr uint8_t DATA_PIN = 4;
 constexpr uint8_t CLOCK_PIN = 3;
 
-// =====================================================
-// 1. CAPTURA PS/2 POR AMBOS FLANCOS
-// =====================================================
+// ---------------------------------------------------
+// IMPORTANTE:
+// Declarar las estructuras ANTES de los prototipos.
+// Esto evita el error de Arduino IDE con "Sample".
+// ---------------------------------------------------
 
-constexpr uint16_t N_SAMPLES = 1024;
-constexpr uint16_t MASK_SAMPLES = N_SAMPLES - 1;
-
-struct Sample {
-  uint32_t us;
-  uint8_t clk;
-  uint8_t data;
+struct PS2Edge {
+  uint32_t timeUs;
+  uint8_t clockLevel;
+  uint8_t dataLevel;
 };
 
-volatile Sample fifo[N_SAMPLES];
+struct HIDEvent {
+  uint16_t usage;
+  bool pressed;
+  bool media;
+};
 
-volatile uint16_t wr = 0;
-volatile uint16_t rd = 0;
-volatile uint32_t overflowPS2 = 0;
+// Prototipos explicitos
+bool popPS2Edge(PS2Edge &edge);
+void processFallingEdge(const PS2Edge &edge);
+void processPS2Byte(uint8_t code);
+void processKey(uint8_t code, bool ext, bool down);
+uint8_t mapKeyboard(uint8_t code, bool ext);
+uint16_t mapMedia(uint8_t code, bool ext);
+void queueHID(uint16_t usage, bool down, bool media);
+void drainPS2();
+void serviceHID();
+void printStats();
+void resetParser();
+void onPaired(bool success);
 
-void ARDUINO_ISR_ATTR onClock() {
-  const uint16_t next =
-    (wr + 1) & MASK_SAMPLES;
+// ===================================================
+// 1. BLUETOOTH
+// ===================================================
 
-  if (next == rd) {
-    ++overflowPS2;
-    return;
-  }
-
-  const uint8_t clk = digitalRead(CLOCK_PIN);
-  const uint8_t data = digitalRead(DATA_PIN);
-  const uint32_t us = micros();
-
-  fifo[wr].us = us;
-  fifo[wr].clk = clk;
-  fifo[wr].data = data;
-
-  wr = next;
-}
-
-bool popSample(Sample &s) {
-  noInterrupts();
-
-  if (rd == wr) {
-    interrupts();
-    return false;
-  }
-
-  const uint16_t i = rd;
-
-  s.us = fifo[i].us;
-  s.clk = fifo[i].clk;
-  s.data = fifo[i].data;
-
-  rd = (i + 1) & MASK_SAMPLES;
-
-  interrupts();
-  return true;
-}
-
-// =====================================================
-// 2. BIBLIOTECA BLUETOOTH HID
-// =====================================================
-
+// Conservar nombre de V3.
+// No cambiar bibliotecas ni conexiones.
 HijelHID_BLEKeyboard keyboard(
   "HP KB9970 V3",
   "KB9970 DIY",
   100
 );
 
-// El 100 es un valor fijo de prueba.
-// No mide ninguna bateria real.
+// El 100 es un valor de prueba, no una
+// lectura real de bateria.
 
 volatile int8_t pairingResult = -1;
 
-void paired(bool ok) {
-  pairingResult = ok ? 1 : 0;
+void onPaired(bool success) {
+  pairingResult = success ? 1 : 0;
 }
 
-// =====================================================
-// 3. COLA DE EVENTOS HID
-// =====================================================
+// ===================================================
+// 2. CAPTURA PS/2 POR AMBOS FLANCOS
+// ===================================================
 
-struct KeyEvent {
-  uint8_t usage;
-  bool pressed;
-};
+constexpr uint16_t SAMPLE_SIZE = 1024;
+constexpr uint16_t SAMPLE_MASK = SAMPLE_SIZE - 1;
 
-constexpr uint16_t N_EVENTS = 256;
-constexpr uint16_t MASK_EVENTS = N_EVENTS - 1;
+volatile PS2Edge sampleQueue[SAMPLE_SIZE];
 
-KeyEvent eventFifo[N_EVENTS];
+volatile uint16_t sampleWrite = 0;
+volatile uint16_t sampleRead = 0;
+volatile uint32_t sampleDrops = 0;
+
+void ARDUINO_ISR_ATTR onClockChange() {
+  uint16_t next =
+    (sampleWrite + 1) & SAMPLE_MASK;
+
+  if (next == sampleRead) {
+    ++sampleDrops;
+    return;
+  }
+
+  uint8_t clk = digitalRead(CLOCK_PIN);
+  uint8_t data = digitalRead(DATA_PIN);
+  uint32_t t = micros();
+
+  sampleQueue[sampleWrite].timeUs = t;
+  sampleQueue[sampleWrite].clockLevel = clk;
+  sampleQueue[sampleWrite].dataLevel = data;
+
+  sampleWrite = next;
+}
+
+bool popPS2Edge(PS2Edge &edge) {
+  noInterrupts();
+
+  if (sampleRead == sampleWrite) {
+    interrupts();
+    return false;
+  }
+
+  uint16_t i = sampleRead;
+
+  edge.timeUs = sampleQueue[i].timeUs;
+  edge.clockLevel = sampleQueue[i].clockLevel;
+  edge.dataLevel = sampleQueue[i].dataLevel;
+
+  sampleRead = (i + 1) & SAMPLE_MASK;
+
+  interrupts();
+  return true;
+}
+
+// ===================================================
+// 3. COLA DE EVENTOS BLUETOOTH
+// ===================================================
+
+constexpr uint16_t EVENT_SIZE = 256;
+constexpr uint16_t EVENT_MASK = EVENT_SIZE - 1;
+
+HIDEvent eventQueue[EVENT_SIZE];
 
 uint16_t eventWrite = 0;
 uint16_t eventRead = 0;
 
-uint32_t overflowsHID = 0;
-uint32_t reportsHID = 0;
-uint32_t ignoredHID = 0;
+bool heldKeys[256] = {false};
+uint16_t activeMedia = 0;
 
-bool held[256] = {false};
 bool needResync = false;
 
-void queueKey(uint8_t usage, bool pressed) {
-  // No enviar teclas antes de que BLE haya
-  // completado el emparejamiento y cifrado.
-  if (!keyboard.isPaired()) {
-    return;
-  }
+uint32_t eventDrops = 0;
+uint32_t reportsSent = 0;
+uint32_t ignoredEvents = 0;
+uint32_t unmappedKeys = 0;
+uint32_t mediaEvents = 0;
 
-  const uint16_t next =
-    (eventWrite + 1) & MASK_EVENTS;
+void clearLocalHID() {
+  memset(heldKeys, 0, sizeof(heldKeys));
+
+  activeMedia = 0;
+  eventRead = eventWrite;
+  needResync = false;
+}
+
+void queueHID(
+  uint16_t usage,
+  bool down,
+  bool media
+) {
+  if (usage == 0) return;
+  if (!keyboard.isPaired()) return;
+
+  uint16_t next =
+    (eventWrite + 1) & EVENT_MASK;
 
   if (next == eventRead) {
-    ++overflowsHID;
-
+    ++eventDrops;
     eventRead = eventWrite;
     needResync = true;
-
     return;
   }
 
-  eventFifo[eventWrite] = {
-    usage,
-    pressed
-  };
+  eventQueue[eventWrite].usage = usage;
+  eventQueue[eventWrite].pressed = down;
+  eventQueue[eventWrite].media = media;
 
   eventWrite = next;
 }
 
-// =====================================================
+// ===================================================
 // 4. PS/2 SCAN CODE SET 2 -> USB HID
-// =====================================================
+// ===================================================
 
-uint8_t toHID(uint8_t c, bool ext) {
+uint8_t mapKeyboard(uint8_t c, bool ext) {
   if (ext) {
     switch (c) {
-      case 0x11: return 0xE6; // Alt derecho
-      case 0x14: return 0xE4; // Ctrl derecho
-      case 0x1F: return 0xE3; // Windows izquierdo
-      case 0x27: return 0xE7; // Windows derecho
+      // Modificadores
+      case 0x11: return 0xE6; // Right Alt
+      case 0x14: return 0xE4; // Right Ctrl
+      case 0x1F: return 0xE3; // Left GUI
+      case 0x27: return 0xE7; // Right GUI
       case 0x2F: return 0x65; // Menu
 
-      case 0x4A: return 0x54; // / numerico
-      case 0x5A: return 0x58; // Enter numerico
+      // Numpad
+      case 0x4A: return 0x54; // /
+      case 0x5A: return 0x58; // Enter
 
-      case 0x69: return 0x4D; // Fin
-      case 0x6B: return 0x50; // Izquierda
-      case 0x6C: return 0x4A; // Inicio
-      case 0x70: return 0x49; // Insertar
-      case 0x71: return 0x4C; // Suprimir
-      case 0x72: return 0x51; // Abajo
-      case 0x74: return 0x4F; // Derecha
-      case 0x75: return 0x52; // Arriba
-      case 0x7A: return 0x4E; // AvPag
-      case 0x7D: return 0x4B; // RePag
+      // Navegacion
+      case 0x69: return 0x4D; // End
+      case 0x6B: return 0x50; // Left
+      case 0x6C: return 0x4A; // Home
+      case 0x70: return 0x49; // Insert
+      case 0x71: return 0x4C; // Delete
+      case 0x72: return 0x51; // Down
+      case 0x74: return 0x4F; // Right
+      case 0x75: return 0x52; // Up
+      case 0x7A: return 0x4E; // Page Down
+      case 0x7D: return 0x4B; // Page Up
 
-      case 0x7C: return 0x46; // Impr Pant
+      case 0x7C: return 0x46; // Print Screen
 
       default: return 0;
     }
@@ -223,24 +258,27 @@ uint8_t toHID(uint8_t c, bool ext) {
     case 0x46: return 0x26; // 9
     case 0x45: return 0x27; // 0
 
-    // Control y puntuacion
+    // Edicion y puntuacion
     case 0x5A: return 0x28; // Enter
     case 0x76: return 0x29; // Escape
-    case 0x66: return 0x2A; // Retroceso
+    case 0x66: return 0x2A; // Backspace
     case 0x0D: return 0x2B; // Tab
-    case 0x29: return 0x2C; // Espacio
+    case 0x29: return 0x2C; // Space
+
     case 0x4E: return 0x2D; // -
     case 0x55: return 0x2E; // =
     case 0x54: return 0x2F; // [
     case 0x5B: return 0x30; // ]
-    case 0x5D: return 0x31; // Barra invertida
-    case 0x61: return 0x64; // Tecla ISO adicional
+    case 0x5D: return 0x31; // Backslash
+
     case 0x4C: return 0x33; // ;
-    case 0x52: return 0x34; // Apostrofo
-    case 0x0E: return 0x35; // Acento grave
-    case 0x41: return 0x36; // Coma
-    case 0x49: return 0x37; // Punto
+    case 0x52: return 0x34; // '
+    case 0x0E: return 0x35; // `
+    case 0x41: return 0x36; // ,
+    case 0x49: return 0x37; // .
     case 0x4A: return 0x38; // /
+
+    case 0x61: return 0x64; // Tecla ISO extra
     case 0x58: return 0x39; // Caps Lock
 
     // F1 a F12
@@ -262,23 +300,24 @@ uint8_t toHID(uint8_t c, bool ext) {
     case 0x7C: return 0x55; // *
     case 0x7B: return 0x56; // -
     case 0x79: return 0x57; // +
-    case 0x69: return 0x59; // 1
-    case 0x72: return 0x5A; // 2
-    case 0x7A: return 0x5B; // 3
-    case 0x6B: return 0x5C; // 4
-    case 0x73: return 0x5D; // 5
-    case 0x74: return 0x5E; // 6
-    case 0x6C: return 0x5F; // 7
-    case 0x75: return 0x60; // 8
-    case 0x7D: return 0x61; // 9
-    case 0x70: return 0x62; // 0
-    case 0x71: return 0x63; // .
+
+    case 0x69: return 0x59; // KP 1
+    case 0x72: return 0x5A; // KP 2
+    case 0x7A: return 0x5B; // KP 3
+    case 0x6B: return 0x5C; // KP 4
+    case 0x73: return 0x5D; // KP 5
+    case 0x74: return 0x5E; // KP 6
+    case 0x6C: return 0x5F; // KP 7
+    case 0x75: return 0x60; // KP 8
+    case 0x7D: return 0x61; // KP 9
+    case 0x70: return 0x62; // KP 0
+    case 0x71: return 0x63; // KP .
 
     // Modificadores
-    case 0x14: return 0xE0; // Ctrl izquierdo
-    case 0x12: return 0xE1; // Shift izquierdo
-    case 0x11: return 0xE2; // Alt izquierdo
-    case 0x59: return 0xE5; // Shift derecho
+    case 0x14: return 0xE0; // Left Ctrl
+    case 0x12: return 0xE1; // Left Shift
+    case 0x11: return 0xE2; // Left Alt
+    case 0x59: return 0xE5; // Right Shift
 
     case 0x7E: return 0x47; // Scroll Lock
 
@@ -286,282 +325,419 @@ uint8_t toHID(uint8_t c, bool ext) {
   }
 }
 
-// =====================================================
-// 5. RECONSTRUCCION DE BYTES PS/2
-// =====================================================
+// ===================================================
+// 5. MULTIMEDIA PS/2 -> HID CONSUMER
+// ===================================================
 
-uint32_t okBytes = 0;
-uint32_t badStart = 0;
-uint32_t badParity = 0;
-uint32_t badStop = 0;
+uint16_t mapMedia(uint8_t c, bool ext) {
+  if (!ext) return 0;
 
-uint32_t cutFrames = 0;
-uint32_t falls = 0;
-uint32_t rises = 0;
-uint32_t shortFalling = 0;
+  switch (c) {
+    // Multimedia
+    case 0x4D: return MEDIA_NEXT_TRACK;
+    case 0x15: return MEDIA_PREV_TRACK;
+    case 0x3B: return MEDIA_STOP;
+    case 0x34: return MEDIA_PLAY_PAUSE;
+    case 0x50: return MEDIA_MEDIA_SELECT;
 
-uint32_t makes = 0;
-uint32_t breaks = 0;
-uint32_t unmapped = 0;
-uint32_t pauses = 0;
+    // Audio
+    case 0x23: return MEDIA_MUTE;
+    case 0x32: return MEDIA_VOLUME_UP;
+    case 0x21: return MEDIA_VOLUME_DOWN;
 
-uint32_t lastFall = 0;
-bool lastFallValid = false;
+    // Aplicaciones
+    case 0x48: return MEDIA_MAIL;
+    case 0x2B: return MEDIA_CALCULATOR;
+    case 0x40: return MEDIA_FILE_EXPLORER;
+
+    // Navegador
+    case 0x10: return MEDIA_BROWSER_SEARCH;
+    case 0x3A: return MEDIA_BROWSER_HOME;
+    case 0x38: return MEDIA_BROWSER_BACK;
+    case 0x30: return MEDIA_BROWSER_FORWARD;
+    case 0x28: return MEDIA_BROWSER_STOP;
+    case 0x20: return MEDIA_BROWSER_REFRESH;
+    case 0x18: return MEDIA_BROWSER_BOOKMARKS;
+
+    // No activar funciones de apagado.
+    // Si el HP envia E0 3F, dejarlo sin mapear
+    // hasta confirmar que tecla fisica es.
+    default: return 0;
+  }
+}
+
+// ===================================================
+// 6. INTERPRETACION PS/2
+// ===================================================
 
 bool prefixE0 = false;
 bool prefixF0 = false;
 
-uint8_t bits = 0;
-uint8_t frameValue = 0;
-uint8_t parity = 0;
+uint32_t lastByteTime = 0;
 
-uint8_t pauseLeft = 0;
+uint32_t keyMakes = 0;
+uint32_t keyBreaks = 0;
+uint32_t pauseCount = 0;
 
-void resetFrame() {
-  bits = 0;
-  frameValue = 0;
-  parity = 0;
+bool debugKeys = false;
+
+// Pause:
+// E1 14 77 E1 F0 14 F0 77
+const uint8_t PAUSE_SEQ[8] = {
+  0xE1, 0x14, 0x77, 0xE1,
+  0xF0, 0x14, 0xF0, 0x77
+};
+
+uint8_t pausePosition = 0;
+
+void resetParser() {
+  prefixE0 = false;
+  prefixF0 = false;
+  pausePosition = 0;
 }
 
-void onByte(uint8_t b) {
-  // PAUSE tiene una secuencia especial de ocho bytes.
-  // Por ahora se reconoce pero no se envia a macOS.
-  if (pauseLeft) {
-    --pauseLeft;
+void processKey(
+  uint8_t code,
+  bool ext,
+  bool down
+) {
+  // E0 12 es un Shift ficticio usado
+  // en Print Screen. No enviarlo.
+  if (ext && code == 0x12) return;
 
-    if (!pauseLeft) {
-      ++pauses;
+  if (down) {
+    ++keyMakes;
+  } else {
+    ++keyBreaks;
+  }
+
+  uint16_t media = mapMedia(code, ext);
+
+  if (media != 0) {
+    ++mediaEvents;
+
+    queueHID(media, down, true);
+
+    if (debugKeys) {
+      Serial.printf(
+        "[MEDIA] %s E0 %02X -> %04X\n",
+        down ? "MAKE" : "BREAK",
+        code,
+        media
+      );
     }
 
     return;
   }
 
-  if (b == 0xE1) {
-    pauseLeft = 7;
-    prefixE0 = false;
-    prefixF0 = false;
+  uint8_t usage = mapKeyboard(code, ext);
+
+  if (usage == 0) {
+    ++unmappedKeys;
+
+    Serial.printf(
+      "[PS2] SIN MAPEAR: %s%02X (%s)\n",
+      ext ? "E0 " : "",
+      code,
+      down ? "MAKE" : "BREAK"
+    );
+
     return;
   }
 
-  if (b == 0xE0) {
+  queueHID(usage, down, false);
+
+  if (debugKeys) {
+    Serial.printf(
+      "[KEY] %s %s%02X -> %02X\n",
+      down ? "MAKE" : "BREAK",
+      ext ? "E0 " : "",
+      code,
+      usage
+    );
+  }
+}
+
+void processPS2Byte(uint8_t code) {
+  uint32_t now = micros();
+
+  // Descartar prefijos caducados.
+  if (lastByteTime != 0 &&
+      (uint32_t)(now - lastByteTime) > 250000) {
+    resetParser();
+  }
+
+  lastByteTime = now;
+
+  // Manejar Pause, que no tiene BREAK normal.
+  if (pausePosition != 0 || code == 0xE1) {
+    if (code == PAUSE_SEQ[pausePosition]) {
+      ++pausePosition;
+
+      if (pausePosition == 8) {
+        pausePosition = 0;
+        ++pauseCount;
+
+        // USB HID Pause = 0x48.
+        queueHID(0x48, true, false);
+        queueHID(0x48, false, false);
+
+        Serial.println("[PS2] PAUSE");
+      }
+
+      return;
+    }
+
+    // Secuencia anomala: recuperar estado.
+    resetParser();
+    return;
+  }
+
+  if (code == 0xE0) {
     prefixE0 = true;
     return;
   }
 
-  if (b == 0xF0) {
+  if (code == 0xF0) {
     prefixF0 = true;
     return;
   }
 
-  const bool down = !prefixF0;
-  const bool ext = prefixE0;
+  bool ext = prefixE0;
+  bool down = !prefixF0;
 
   prefixE0 = false;
   prefixF0 = false;
 
-  // Print Screen incluye un Shift ficticio.
-  // No enviarlo como una tecla real.
-  if (ext && b == 0x12) {
-    return;
-  }
-
-  if (down) {
-    ++makes;
-  } else {
-    ++breaks;
-  }
-
-  uint8_t usage = toHID(b, ext);
-
-  if (usage == 0) {
-    ++unmapped;
-    return;
-  }
-
-  queueKey(usage, down);
+  processKey(code, ext, down);
 }
 
-void onFalling(const Sample &s) {
-  ++falls;
+// ===================================================
+// 7. RECEPTOR DE TRAMAS DE 11 BITS
+// ===================================================
 
-  if (lastFallValid) {
-    uint32_t dt = s.us - lastFall;
+uint32_t validBytes = 0;
+uint32_t badStart = 0;
+uint32_t badParity = 0;
+uint32_t badStop = 0;
+uint32_t cutFrames = 0;
+
+uint32_t clockFalls = 0;
+uint32_t clockRises = 0;
+uint32_t shortClocks = 0;
+
+uint32_t lastFall = 0;
+bool haveLastFall = false;
+
+uint8_t bitIndex = 0;
+uint8_t currentByte = 0;
+uint8_t parityValue = 0;
+
+void resetFrame() {
+  bitIndex = 0;
+  currentByte = 0;
+  parityValue = 0;
+}
+
+void processFallingEdge(const PS2Edge &edge) {
+  ++clockFalls;
+
+  if (haveLastFall) {
+    uint32_t dt = edge.timeUs - lastFall;
 
     if (dt < 65) {
-      ++shortFalling;
+      ++shortClocks;
     }
 
-    if (dt > 300 && bits != 0) {
+    if (dt > 300 && bitIndex != 0) {
       ++cutFrames;
-
       resetFrame();
-      prefixE0 = false;
-      prefixF0 = false;
+      resetParser();
     }
   }
 
-  lastFall = s.us;
-  lastFallValid = true;
+  lastFall = edge.timeUs;
+  haveLastFall = true;
 
-  const uint8_t bit = s.data & 1;
+  uint8_t bit = edge.dataLevel & 1;
 
-  if (bits == 0) {
+  if (bitIndex == 0) {
     if (bit != 0) {
       ++badStart;
       return;
     }
 
-    frameValue = 0;
-    parity = 0;
+    currentByte = 0;
+    parityValue = 0;
   }
-  else if (bits <= 8) {
-    frameValue |=
-      (uint8_t)(bit << (bits - 1));
+  else if (bitIndex <= 8) {
+    currentByte |=
+      (uint8_t)(bit << (bitIndex - 1));
 
-    parity ^= bit;
+    parityValue ^= bit;
   }
-  else if (bits == 9) {
-    parity ^= bit;
+  else if (bitIndex == 9) {
+    parityValue ^= bit;
   }
 
-  ++bits;
+  ++bitIndex;
 
-  if (bits == 11) {
+  if (bitIndex == 11) {
     if (bit != 1) {
       ++badStop;
-      prefixE0 = false;
-      prefixF0 = false;
+      resetParser();
     }
-    else if (parity != 1) {
+    else if (parityValue != 1) {
       ++badParity;
-      prefixE0 = false;
-      prefixF0 = false;
+      resetParser();
     }
     else {
-      ++okBytes;
-      onByte(frameValue);
+      ++validBytes;
+      processPS2Byte(currentByte);
     }
 
     resetFrame();
   }
 }
 
-// Vaciar la cola sin bloquear el Bluetooth.
 void drainPS2() {
-  Sample s;
-  uint16_t processed = 0;
+  PS2Edge edge;
+  uint16_t count = 0;
 
-  while (processed < 512 && popSample(s)) {
-    if (s.clk == 0) {
-      onFalling(s);
+  // Procesar como maximo 512 muestras
+  // por iteracion para dar tiempo a BLE.
+  while (count < 512 && popPS2Edge(edge)) {
+    if (edge.clockLevel == 0) {
+      processFallingEdge(edge);
     } else {
-      ++rises;
+      ++clockRises;
     }
 
-    ++processed;
+    ++count;
   }
 }
 
-// =====================================================
-// 6. ENVIO HID ORDENADO Y RECUPERACION
-// =====================================================
+// ===================================================
+// 8. ENVIAR TECLAS POR BLUETOOTH
+// ===================================================
 
 void serviceHID() {
   static bool wasPaired = false;
-  static uint32_t lastReport = 0;
+  static uint32_t lastSend = 0;
 
-  const bool ready = keyboard.isPaired();
+  bool ready = keyboard.isPaired();
 
-  // Detectar enlace listo o enlace perdido.
   if (ready != wasPaired) {
-    eventRead = eventWrite;
-    memset(held, 0, sizeof(held));
-
-    needResync = false;
     wasPaired = ready;
 
-    Serial.println(
-      ready
-        ? "[BLE] EMPAREJADO Y LISTO"
-        : "[BLE] ENLACE NO LISTO"
-    );
+    clearLocalHID();
 
     if (ready) {
       keyboard.releaseAll();
-      lastReport = millis();
+
+      Serial.println(
+        "[BLE] EMPAREJADO Y LISTO"
+      );
+    } else {
+      Serial.println(
+        "[BLE] ENLACE NO LISTO"
+      );
+    }
+
+    lastSend = millis();
+  }
+
+  if (!ready) return;
+
+  // Recuperar de un desbordamiento.
+  if (needResync) {
+    keyboard.releaseAll();
+    clearLocalHID();
+    lastSend = millis();
+    return;
+  }
+
+  // Conservar el ritmo que ya funciono en V3.
+  if ((uint32_t)(millis() - lastSend) < 20) {
+    return;
+  }
+
+  if (eventRead == eventWrite) return;
+
+  HIDEvent ev = eventQueue[eventRead];
+
+  eventRead = (eventRead + 1) & EVENT_MASK;
+
+  if (ev.media) {
+    if (ev.pressed) {
+      if (activeMedia == ev.usage) {
+        ++ignoredEvents;
+        return;
+      }
+
+      if (activeMedia != 0) {
+        keyboard.release((uint16_t)activeMedia);
+      }
+
+      activeMedia = ev.usage;
+      keyboard.press((uint16_t)ev.usage);
+
+    } else {
+      if (activeMedia != ev.usage) {
+        ++ignoredEvents;
+        return;
+      }
+
+      keyboard.release((uint16_t)ev.usage);
+      activeMedia = 0;
+    }
+  } else {
+    uint8_t usage = (uint8_t)ev.usage;
+
+    if (heldKeys[usage] == ev.pressed) {
+      ++ignoredEvents;
+      return;
+    }
+
+    heldKeys[usage] = ev.pressed;
+
+    if (ev.pressed) {
+      keyboard.press((uint8_t)usage);
+    } else {
+      keyboard.release((uint8_t)usage);
     }
   }
 
-  if (!ready) {
-    return;
-  }
-
-  // Si la cola se lleno, liberar todas las
-  // teclas para evitar teclas pegadas.
-  if (needResync) {
-    keyboard.releaseAll();
-
-    eventRead = eventWrite;
-    memset(held, 0, sizeof(held));
-
-    needResync = false;
-    lastReport = millis();
-
-    return;
-  }
-
-  // Mantener separados MAKE y BREAK.
-  // Una notificacion aproximadamente cada 20 ms.
-  if ((uint32_t)(millis() - lastReport) < 20) {
-    return;
-  }
-
-  if (eventRead == eventWrite) {
-    return;
-  }
-
-  KeyEvent ev = eventFifo[eventRead];
-
-  eventRead =
-    (eventRead + 1) & MASK_EVENTS;
-
-  // No enviar dos veces un MAKE si la tecla
-  // ya esta pulsada, ni un BREAK redundante.
-  if (held[ev.usage] == ev.pressed) {
-    ++ignoredHID;
-    return;
-  }
-
-  held[ev.usage] = ev.pressed;
-
-  if (ev.pressed) {
-    keyboard.press(ev.usage);
-  } else {
-    keyboard.release(ev.usage);
-  }
-
-  ++reportsHID;
-  lastReport = millis();
+  ++reportsSent;
+  lastSend = millis();
 }
 
-// =====================================================
-// 7. ESTADISTICAS
-// =====================================================
+// ===================================================
+// 9. ESTADISTICAS
+// ===================================================
 
 void printStats() {
   uint32_t drops;
 
   noInterrupts();
-  drops = overflowPS2;
+  drops = sampleDrops;
   interrupts();
 
+  Serial.println();
+  Serial.println("===== HP KB9970 V4.1 =====");
+
   Serial.printf(
-    "[PS2] OK=%lu MAKE=%lu BREAK=%lu "
-    "INICIO=%lu PARIDAD=%lu PARADA=%lu "
-    "CORTADAS=%lu COLA=%lu\n",
-    (unsigned long)okBytes,
-    (unsigned long)makes,
-    (unsigned long)breaks,
+    "[PS2] BYTES=%lu MAKE=%lu BREAK=%lu "
+    "PAUSE=%lu\n",
+    (unsigned long)validBytes,
+    (unsigned long)keyMakes,
+    (unsigned long)keyBreaks,
+    (unsigned long)pauseCount
+  );
+
+  Serial.printf(
+    "[ERROR] INICIO=%lu PARIDAD=%lu "
+    "PARADA=%lu CORTADAS=%lu COLA=%lu\n",
     (unsigned long)badStart,
     (unsigned long)badParity,
     (unsigned long)badStop,
@@ -570,29 +746,40 @@ void printStats() {
   );
 
   Serial.printf(
-    "[CLK] BAJADAS=%lu SUBIDAS=%lu CORTOS=%lu\n",
-    (unsigned long)falls,
-    (unsigned long)rises,
-    (unsigned long)shortFalling
+    "[CLOCK] BAJADAS=%lu SUBIDAS=%lu "
+    "CORTOS=%lu\n",
+    (unsigned long)clockFalls,
+    (unsigned long)clockRises,
+    (unsigned long)shortClocks
   );
 
   Serial.printf(
-    "[BLE] CONECTADO=%d EMPAREJADO=%d "
-    "REPORTES=%lu COLA_PERDIDA=%lu "
-    "DUPLICADOS=%lu SIN_MAPA=%lu PAUSE=%lu\n",
+    "[HID] CONECTADO=%d PAIRED=%d "
+    "REPORTES=%lu MEDIA=%lu "
+    "SIN_MAPA=%lu PERDIDOS=%lu "
+    "IGNORADOS=%lu\n",
     keyboard.isConnected(),
     keyboard.isPaired(),
-    (unsigned long)reportsHID,
-    (unsigned long)overflowsHID,
-    (unsigned long)ignoredHID,
-    (unsigned long)unmapped,
-    (unsigned long)pauses
+    (unsigned long)reportsSent,
+    (unsigned long)mediaEvents,
+    (unsigned long)unmappedKeys,
+    (unsigned long)eventDrops,
+    (unsigned long)ignoredEvents
   );
+
+  Serial.printf(
+    "[LEDS HOST] CAPS=%d NUM=%d SCROLL=%d\n",
+    keyboard.isCapsLockOn(),
+    keyboard.isNumLockOn(),
+    keyboard.isScrollLockOn()
+  );
+
+  Serial.println("==========================");
 }
 
-// =====================================================
-// 8. SETUP
-// =====================================================
+// ===================================================
+// 10. SETUP
+// ===================================================
 
 void setup() {
   Serial.begin(115200);
@@ -602,60 +789,57 @@ void setup() {
   pinMode(CLOCK_PIN, INPUT_PULLUP);
 
   Serial.println();
-  Serial.println(
-    "=== HP KB9970 V3: PS/2 + BLE HID ==="
-  );
+  Serial.println("==============================");
+  Serial.println(" HP KB9970 BLUETOOTH V4.1");
+  Serial.println(" ESP32-C3 SUPERMINI");
+  Serial.println("==============================");
 
-  Serial.println(
-    "NimBLE 2.5.2 + HijelHID 0.6.0"
-  );
-
-  // Biblioteca BLE probada con macOS.
   keyboard.setLogLevel(HIDLogLevel::Normal);
 
-  // Emparejamiento Just Works.
   keyboard.setSecurityMode(
     HIDSecurity::JustWorks
   );
 
-  // Intervalo moderado para estabilidad.
-  // El anfitrion decide si acepta el valor.
   keyboard.setConnIntervalMs(30);
+  keyboard.onPairingComplete(onPaired);
 
-  // Informar si la seguridad se completa.
-  keyboard.onPairingComplete(paired);
-
-  // Inicializar BLE antes de activar PS/2.
   keyboard.begin();
 
   attachInterrupt(
     digitalPinToInterrupt(CLOCK_PIN),
-    onClock,
+    onClockChange,
     CHANGE
   );
 
   Serial.println(
-    "Buscar: HP KB9970 V3 en Bluetooth"
+    "[BLE] Nombre: HP KB9970 V3"
   );
 
   Serial.println(
-    "Comandos: s=estadisticas, "
-    "x=borrar vinculos del ESP32"
+    "Comandos:"
+  );
+
+  Serial.println(
+    "s = estadisticas"
+  );
+
+  Serial.println(
+    "d = activar/desactivar debug"
+  );
+
+  Serial.println(
+    "x = borrar vinculos locales"
   );
 }
 
-// =====================================================
-// 9. LOOP
-// =====================================================
+// ===================================================
+// 11. LOOP
+// ===================================================
 
 void loop() {
-  // Primera prioridad: recibir sin perder bits.
   drainPS2();
-
-  // Segunda prioridad: enviar teclas por BLE.
   serviceHID();
 
-  // Resultado del emparejamiento.
   if (pairingResult != -1) {
     int8_t result = pairingResult;
     pairingResult = -1;
@@ -667,7 +851,6 @@ void loop() {
     );
   }
 
-  // Comandos por USB.
   while (Serial.available()) {
     char c = Serial.read();
 
@@ -675,11 +858,20 @@ void loop() {
       printStats();
     }
 
+    if (c == 'd' || c == 'D') {
+      debugKeys = !debugKeys;
+
+      Serial.printf(
+        "[DEBUG] TECLAS=%s\n",
+        debugKeys ? "ON" : "OFF"
+      );
+    }
+
     if (c == 'x' || c == 'X') {
       if (keyboard.isConnected()) {
         Serial.println(
-          "[BLE] Desconecta desde macOS "
-          "antes de borrar vinculos."
+          "[BLE] Desconectar antes "
+          "de borrar vinculos."
         );
       } else {
         keyboard.clearBonds();
@@ -687,24 +879,16 @@ void loop() {
         Serial.println(
           "[BLE] Vinculos locales borrados."
         );
-
-        Serial.println(
-          "[BLE] Si macOS lo tenia guardado, "
-          "selecciona Olvidar dispositivo."
-        );
       }
     }
   }
 
-  // Diagnostico periodico.
-  static uint32_t last = 0;
+  static uint32_t lastStats = 0;
 
-  if (millis() - last >= 10000) {
-    last = millis();
+  if (millis() - lastStats >= 10000) {
+    lastStats = millis();
     printStats();
   }
 
-  // El ESP32-C3 tiene un solo nucleo.
-  // Dar tiempo al proceso Bluetooth.
   delay(1);
 }
