@@ -166,4 +166,3 @@ A keyboard with a perfectly good key mechanism and working original electronics 
 
 **Status:** Working prototype / stable firmware v4.5.  
 **Hardware verified:** HP KB-9970 + ESP32-C3 SuperMini.  
-**License:** Not specified. Add a license file only after selecting the terms you want to use.
