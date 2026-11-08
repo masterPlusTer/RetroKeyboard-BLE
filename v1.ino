@@ -1,30 +1,83 @@
 
 #include <Arduino.h>
 #include <HijelHID_BLEKeyboard.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
+#include <esp_err.h>
 
 // ====================================================
-// HP KB-9970 BLUETOOTH V4.5
-// ESP32-C3 SuperMini
+// HP KB-9970 BLUETOOTH V4.6.2
+// ESP32-C3 SUPERMINI
 //
 // PS/2 DATA  -> GPIO4
 // PS/2 CLOCK -> GPIO3
 //
-// HijelHID_BLEKeyboard 0.6.x
-// NimBLE-Arduino 2.x
+// HID: 8 ms predeterminados
+// Watchdog: 15 segundos
+// KEEP-ALIVE CPU experimental para power bank IP5306
 //
-// LED automaticos y velocidad HID configurable.
-// Alimentacion PS/2 a 3.3 V: experimental.
+// IMPORTANTE:
+// El teclado HP esta alimentado experimentalmente
+// a 3.3 V. Su alimentacion nominal es de 5 V.
+// No introducir 5 V en los GPIO del ESP32.
 // ====================================================
 
-constexpr uint8_t DATA_PIN = 4;
-constexpr uint8_t CLOCK_PIN = 3;
+// -------------------- PINES -------------------------
 
-// Declarar tipos ANTES de los prototipos.
-// Evita errores del preprocesador de Arduino IDE.
+constexpr uint8_t PIN_DATA = 4;
+constexpr uint8_t PIN_CLOCK = 3;
+
+// -------------------- COLAS -------------------------
+
+constexpr uint16_t EDGE_N = 1024;
+constexpr uint16_t EDGE_MASK = EDGE_N - 1;
+
+constexpr uint16_t HID_N = 256;
+constexpr uint16_t HID_MASK = HID_N - 1;
+
+// -------------------- TIEMPOS -----------------------
+
+constexpr uint32_t PS2_TX_QUIET_US = 20000;
+constexpr uint32_t BLE_SETTLE_MS = 2000;
+constexpr uint32_t LED_STABLE_MS = 250;
+constexpr uint32_t CMD_TIMEOUT_MS = 150;
+constexpr uint32_t LED_PARAM_TIMEOUT_MS = 250;
+
+// ====================================================
+// KEEP-ALIVE
+//
+// Cada 18 segundos inicia una ventana de actividad
+// de 4 segundos.
+//
+// Dentro de esa ventana, cada iteracion realiza
+// aproximadamente 1.5 ms de calculo intensivo.
+//
+// El loop sigue atendiendo PS/2, BLE y watchdog.
+//
+// Es un experimento: NO garantiza alcanzar el
+// umbral de corriente del IP5306.
+// ====================================================
+
+constexpr uint32_t KEEP_INTERVAL_MS = 18000;
+constexpr uint32_t KEEP_DURATION_MS = 4000;
+constexpr uint32_t KEEP_SLICE_US = 1500;
+
+bool keepAliveEnabled = true;
+bool keepAliveActive = false;
+
+uint32_t keepWindowStartMs = 0;
+uint32_t keepPulseStartMs = 0;
+uint32_t keepPulseCount = 0;
+
+volatile uint32_t keepCalculation = 0x12345678;
+
+// ====================================================
+// 1. ESTRUCTURAS Y PROTOTIPOS
+// ====================================================
 
 struct PS2Edge {
-  uint32_t us;
-  uint8_t clk;
+  uint32_t timeUs;
+  uint8_t clock;
   uint8_t data;
 };
 
@@ -36,62 +89,68 @@ struct HIDEvent {
 };
 
 bool popEdge(PS2Edge &e);
-void fallingEdge(const PS2Edge &e);
-void receiveByte(uint8_t b);
-void handleKey(uint8_t code, bool ext, bool down);
-uint8_t keyboardUsage(uint8_t code, bool ext);
-uint16_t consumerUsage(uint8_t code, bool ext);
-void drainPS2();
-void serviceHID();
-void servicePS2Commands();
-void serviceAutoStartup();
-void resetLEDSync();
-void printStats();
+void processFall(const PS2Edge &e);
+void processPS2Byte(uint8_t b);
+void processKey(uint8_t c, bool ext, bool down);
+
+uint8_t keyUsage(uint8_t c, bool ext);
+uint16_t mediaUsage(uint8_t c, bool ext);
+
+void resetFrame();
 void resetParser();
-bool sendHostByte(uint8_t b);
-void commandFailure(const char *reason);
+
+void servicePS2();
+void serviceHID();
+void serviceCommands();
+void serviceConnection();
+void serviceKeepAlive();
+
+void printStats();
+void printHelp();
+void serialCommands();
+
+bool sendPS2Byte(uint8_t b);
+void commandError(const char *why);
 
 // ====================================================
-// 1. BLUETOOTH
+// 2. BLUETOOTH
 // ====================================================
 
-// Conservar el nombre del dispositivo emparejado.
+// Conservar el nombre utilizado anteriormente.
+
 HijelHID_BLEKeyboard keyboard(
   "HP KB9970 V3",
   "KB9970 DIY",
   100
 );
 
-// 100 es una bateria simulada.
+// Bateria indicada como 100% solo de forma simulada.
 
-volatile int8_t pairingResult = -1;
+volatile int8_t pairingStatus = -1;
 
-void paired(bool success) {
-  pairingResult = success ? 1 : 0;
+void pairingDone(bool success) {
+  pairingStatus = success ? 1 : 0;
 }
 
 // ====================================================
-// 2. CAPTURA PS/2 POR AMBOS FLANCOS
+// 3. INTERRUPCION PS/2
 // ====================================================
 
-constexpr uint16_t EDGE_SIZE = 1024;
-constexpr uint16_t EDGE_MASK = EDGE_SIZE - 1;
-
-volatile PS2Edge edgeQ[EDGE_SIZE];
+volatile PS2Edge edges[EDGE_N];
 
 volatile uint16_t edgeW = 0;
 volatile uint16_t edgeR = 0;
 
 volatile uint32_t edgeDrops = 0;
-volatile uint32_t lastEdgeIRQ = 0;
+volatile uint32_t lastEdgeUs = 0;
 
-volatile bool hostTransmitting = false;
+volatile bool transmitting = false;
 
-void ARDUINO_ISR_ATTR onClockEdge() {
-  if (hostTransmitting) return;
+void ARDUINO_ISR_ATTR clockISR() {
+  if (transmitting) return;
 
   uint32_t now = micros();
-  lastEdgeIRQ = now;
+  lastEdgeUs = now;
 
   uint16_t next = (edgeW + 1) & EDGE_MASK;
 
@@ -100,9 +159,9 @@ void ARDUINO_ISR_ATTR onClockEdge() {
     return;
   }
 
-  edgeQ[edgeW].us = now;
-  edgeQ[edgeW].clk = digitalRead(CLOCK_PIN);
-  edgeQ[edgeW].data = digitalRead(DATA_PIN);
+  edges[edgeW].timeUs = now;
+  edges[edgeW].clock = digitalRead(PIN_CLOCK);
+  edges[edgeW].data = digitalRead(PIN_DATA);
 
   edgeW = next;
 }
@@ -115,85 +174,89 @@ bool popEdge(PS2Edge &e) {
     return false;
   }
 
-  uint16_t i = edgeR;
+  uint16_t n = edgeR;
 
-  e.us = edgeQ[i].us;
-  e.clk = edgeQ[i].clk;
-  e.data = edgeQ[i].data;
+  e.timeUs = edges[n].timeUs;
+  e.clock = edges[n].clock;
+  e.data = edges[n].data;
 
-  edgeR = (i + 1) & EDGE_MASK;
+  edgeR = (n + 1) & EDGE_MASK;
 
   interrupts();
   return true;
 }
 
 // ====================================================
-// 3. COLA HID Y CONTROL DE VELOCIDAD
+// 4. COLA HID
 // ====================================================
 
-constexpr uint16_t HID_SIZE = 256;
-constexpr uint16_t HID_MASK = HID_SIZE - 1;
-
-HIDEvent hidQ[HID_SIZE];
+HIDEvent hidEvents[HID_N];
 
 uint16_t hidW = 0;
 uint16_t hidR = 0;
 
-bool held[256] = {};
-uint16_t activeMedia = 0;
+bool hidHeld[256] = {};
+bool ps2Held[512] = {};
 
-bool needResync = false;
+uint16_t physicalHeldCount = 0;
+uint16_t mediaHeld = 0;
+
+bool hidNeedsRelease = false;
 
 uint32_t hidDrops = 0;
 uint32_t hidSent = 0;
-uint32_t hidIgnored = 0;
+uint32_t ignored = 0;
 uint32_t unmapped = 0;
+uint32_t resyncs = 0;
 
-bool debugKeys = false;
+uint32_t lastKeyMs = 0;
 
-// NUEVO: velocidad seleccionable.
-//
-// 1 = 20 ms, conservador
-// 2 = 12 ms, rapido (predeterminado)
-// 3 =  8 ms, experimental
+uint16_t maxQueue = 0;
+uint32_t maxQueueWaitMs = 0;
+uint64_t sumQueueWaitMs = 0;
+uint32_t queueSamples = 0;
+
+// Velocidad inicial de 8 ms.
 
 uint8_t hidGapMs = 8;
 
-// NUEVO: estadisticas de rendimiento.
+bool debugKeys = false;
 
-uint16_t hidPeakQueue = 0;
+void clearHIDQueue() {
+  memset(hidHeld, 0, sizeof(hidHeld));
 
-uint32_t hidMaxWaitMs = 0;
-uint64_t hidWaitSumMs = 0;
-uint32_t hidWaitSamples = 0;
-
-void resetHID() {
-  memset(held, 0, sizeof(held));
-
-  activeMedia = 0;
-
+  mediaHeld = 0;
   hidR = hidW;
-  needResync = false;
+  hidNeedsRelease = false;
 }
 
-void enqueueKey(
-  uint16_t usage,
+void clearPhysicalKeys() {
+  memset(ps2Held, 0, sizeof(ps2Held));
+  physicalHeldCount = 0;
+}
+
+void addHID(
+  uint16_t u,
   bool down,
   bool media = false
 ) {
-  if (usage == 0) return;
-  if (!keyboard.isPaired()) return;
+  if (!u) return;
+
+  if (!keyboard.isConnected() ||
+      !keyboard.isPaired()) {
+    return;
+  }
 
   uint16_t next = (hidW + 1) & HID_MASK;
 
   if (next == hidR) {
     ++hidDrops;
-    needResync = true;
+    hidNeedsRelease = true;
     return;
   }
 
-  hidQ[hidW] = {
-    usage,
+  hidEvents[hidW] = {
+    u,
     millis(),
     down,
     media
@@ -201,42 +264,41 @@ void enqueueKey(
 
   hidW = next;
 
-  uint16_t pending =
-    (hidW - hidR) & HID_MASK;
+  uint16_t pending = (hidW - hidR) & HID_MASK;
 
-  if (pending > hidPeakQueue) {
-    hidPeakQueue = pending;
+  if (pending > maxQueue) {
+    maxQueue = pending;
   }
 }
 
 // ====================================================
-// 4. PS/2 SCAN CODE SET 2 -> USB HID
+// 5. SCAN CODE SET 2 -> USB HID
 // ====================================================
 
-uint8_t keyboardUsage(uint8_t c, bool ext) {
+uint8_t keyUsage(uint8_t c, bool ext) {
   if (ext) {
     switch (c) {
-      case 0x11: return 0xE6; // Alt derecho
-      case 0x14: return 0xE4; // Ctrl derecho
-      case 0x1F: return 0xE3; // Windows izquierdo
-      case 0x27: return 0xE7; // Windows derecho
-      case 0x2F: return 0x65; // Menu
+      case 0x11: return 0xE6;
+      case 0x14: return 0xE4;
+      case 0x1F: return 0xE3;
+      case 0x27: return 0xE7;
+      case 0x2F: return 0x65;
 
-      case 0x4A: return 0x54; // / numerico
-      case 0x5A: return 0x58; // Enter numerico
+      case 0x4A: return 0x54;
+      case 0x5A: return 0x58;
 
-      case 0x69: return 0x4D; // Fin
-      case 0x6B: return 0x50; // Izquierda
-      case 0x6C: return 0x4A; // Inicio
-      case 0x70: return 0x49; // Insert
-      case 0x71: return 0x4C; // Delete
-      case 0x72: return 0x51; // Abajo
-      case 0x74: return 0x4F; // Derecha
-      case 0x75: return 0x52; // Arriba
-      case 0x7A: return 0x4E; // Page Down
-      case 0x7D: return 0x4B; // Page Up
+      case 0x69: return 0x4D;
+      case 0x6B: return 0x50;
+      case 0x6C: return 0x4A;
+      case 0x70: return 0x49;
+      case 0x71: return 0x4C;
+      case 0x72: return 0x51;
+      case 0x74: return 0x4F;
+      case 0x75: return 0x52;
+      case 0x7A: return 0x4E;
+      case 0x7D: return 0x4B;
 
-      case 0x7C: return 0x46; // Print Screen
+      case 0x7C: return 0x46;
 
       default: return 0;
     }
@@ -244,72 +306,72 @@ uint8_t keyboardUsage(uint8_t c, bool ext) {
 
   switch (c) {
     // Letras
-    case 0x1C: return 0x04; // A
-    case 0x32: return 0x05; // B
-    case 0x21: return 0x06; // C
-    case 0x23: return 0x07; // D
-    case 0x24: return 0x08; // E
-    case 0x2B: return 0x09; // F
-    case 0x34: return 0x0A; // G
-    case 0x33: return 0x0B; // H
-    case 0x43: return 0x0C; // I
-    case 0x3B: return 0x0D; // J
-    case 0x42: return 0x0E; // K
-    case 0x4B: return 0x0F; // L
-    case 0x3A: return 0x10; // M
-    case 0x31: return 0x11; // N
-    case 0x44: return 0x12; // O
-    case 0x4D: return 0x13; // P
-    case 0x15: return 0x14; // Q
-    case 0x2D: return 0x15; // R
-    case 0x1B: return 0x16; // S
-    case 0x2C: return 0x17; // T
-    case 0x3C: return 0x18; // U
-    case 0x2A: return 0x19; // V
-    case 0x1D: return 0x1A; // W
-    case 0x22: return 0x1B; // X
-    case 0x35: return 0x1C; // Y
-    case 0x1A: return 0x1D; // Z
 
-    // Numeros superiores
-    case 0x16: return 0x1E; // 1
-    case 0x1E: return 0x1F; // 2
-    case 0x26: return 0x20; // 3
-    case 0x25: return 0x21; // 4
-    case 0x2E: return 0x22; // 5
-    case 0x36: return 0x23; // 6
-    case 0x3D: return 0x24; // 7
-    case 0x3E: return 0x25; // 8
-    case 0x46: return 0x26; // 9
-    case 0x45: return 0x27; // 0
+    case 0x1C: return 0x04;
+    case 0x32: return 0x05;
+    case 0x21: return 0x06;
+    case 0x23: return 0x07;
+    case 0x24: return 0x08;
+    case 0x2B: return 0x09;
+    case 0x34: return 0x0A;
+    case 0x33: return 0x0B;
+    case 0x43: return 0x0C;
+    case 0x3B: return 0x0D;
+    case 0x42: return 0x0E;
+    case 0x4B: return 0x0F;
+    case 0x3A: return 0x10;
+    case 0x31: return 0x11;
+    case 0x44: return 0x12;
+    case 0x4D: return 0x13;
+    case 0x15: return 0x14;
+    case 0x2D: return 0x15;
+    case 0x1B: return 0x16;
+    case 0x2C: return 0x17;
+    case 0x3C: return 0x18;
+    case 0x2A: return 0x19;
+    case 0x1D: return 0x1A;
+    case 0x22: return 0x1B;
+    case 0x35: return 0x1C;
+    case 0x1A: return 0x1D;
+
+    // Numeros
+
+    case 0x16: return 0x1E;
+    case 0x1E: return 0x1F;
+    case 0x26: return 0x20;
+    case 0x25: return 0x21;
+    case 0x2E: return 0x22;
+    case 0x36: return 0x23;
+    case 0x3D: return 0x24;
+    case 0x3E: return 0x25;
+    case 0x46: return 0x26;
+    case 0x45: return 0x27;
 
     // Edicion
-    case 0x5A: return 0x28; // Enter
-    case 0x76: return 0x29; // Escape
-    case 0x66: return 0x2A; // Backspace
-    case 0x0D: return 0x2B; // Tab
-    case 0x29: return 0x2C; // Espacio
 
-    // Signos
-    case 0x4E: return 0x2D; // -
-    case 0x55: return 0x2E; // =
-    case 0x54: return 0x2F; // [
-    case 0x5B: return 0x30; // ]
-    case 0x5D: return 0x31; // Backslash
-    case 0x4C: return 0x33; // ;
-    case 0x52: return 0x34; // Apostrofe
-    case 0x0E: return 0x35; // Grave
-    case 0x41: return 0x36; // ,
-    case 0x49: return 0x37; // .
-    case 0x4A: return 0x38; // /
+    case 0x5A: return 0x28;
+    case 0x76: return 0x29;
+    case 0x66: return 0x2A;
+    case 0x0D: return 0x2B;
+    case 0x29: return 0x2C;
 
-    // Tecla ISO extra
+    case 0x4E: return 0x2D;
+    case 0x55: return 0x2E;
+    case 0x54: return 0x2F;
+    case 0x5B: return 0x30;
+    case 0x5D: return 0x31;
+    case 0x4C: return 0x33;
+    case 0x52: return 0x34;
+    case 0x0E: return 0x35;
+    case 0x41: return 0x36;
+    case 0x49: return 0x37;
+    case 0x4A: return 0x38;
+
     case 0x61: return 0x64;
-
-    // Caps Lock
     case 0x58: return 0x39;
 
-    // F1 a F12
+    // F1-F12
+
     case 0x05: return 0x3A;
     case 0x06: return 0x3B;
     case 0x04: return 0x3C;
@@ -323,41 +385,43 @@ uint8_t keyboardUsage(uint8_t c, bool ext) {
     case 0x78: return 0x44;
     case 0x07: return 0x45;
 
-    // Teclado numerico
-    case 0x77: return 0x53; // Num Lock
-    case 0x7C: return 0x55; // *
-    case 0x7B: return 0x56; // -
-    case 0x79: return 0x57; // +
+    // Numpad
 
-    case 0x69: return 0x59; // 1
-    case 0x72: return 0x5A; // 2
-    case 0x7A: return 0x5B; // 3
-    case 0x6B: return 0x5C; // 4
-    case 0x73: return 0x5D; // 5
-    case 0x74: return 0x5E; // 6
-    case 0x6C: return 0x5F; // 7
-    case 0x75: return 0x60; // 8
-    case 0x7D: return 0x61; // 9
-    case 0x70: return 0x62; // 0
-    case 0x71: return 0x63; // .
+    case 0x77: return 0x53;
+    case 0x7C: return 0x55;
+    case 0x7B: return 0x56;
+    case 0x79: return 0x57;
+
+    case 0x69: return 0x59;
+    case 0x72: return 0x5A;
+    case 0x7A: return 0x5B;
+    case 0x6B: return 0x5C;
+    case 0x73: return 0x5D;
+    case 0x74: return 0x5E;
+    case 0x6C: return 0x5F;
+    case 0x75: return 0x60;
+    case 0x7D: return 0x61;
+    case 0x70: return 0x62;
+    case 0x71: return 0x63;
 
     // Modificadores
-    case 0x14: return 0xE0; // Ctrl izquierdo
-    case 0x12: return 0xE1; // Shift izquierdo
-    case 0x11: return 0xE2; // Alt izquierdo
-    case 0x59: return 0xE5; // Shift derecho
 
-    case 0x7E: return 0x47; // Scroll Lock
+    case 0x14: return 0xE0;
+    case 0x12: return 0xE1;
+    case 0x11: return 0xE2;
+    case 0x59: return 0xE5;
+
+    case 0x7E: return 0x47;
 
     default: return 0;
   }
 }
 
 // ====================================================
-// 5. MULTIMEDIA
+// 6. MULTIMEDIA
 // ====================================================
 
-uint16_t consumerUsage(uint8_t c, bool ext) {
+uint16_t mediaUsage(uint8_t c, bool ext) {
   if (!ext) return 0;
 
   switch (c) {
@@ -388,29 +452,28 @@ uint16_t consumerUsage(uint8_t c, bool ext) {
 }
 
 // ====================================================
-// 6. TRAMAS Y PREFIJOS PS/2
+// 7. DECODIFICADOR PS/2
 // ====================================================
 
-uint32_t validBytes = 0;
+uint32_t bytesOK = 0;
+uint32_t makes = 0;
+uint32_t breaks = 0;
+uint32_t pauses = 0;
+
 uint32_t badStart = 0;
 uint32_t badParity = 0;
 uint32_t badStop = 0;
 uint32_t cutFrames = 0;
 
-uint32_t falls = 0;
-uint32_t rises = 0;
-uint32_t shortClocks = 0;
+uint32_t lastFallUs = 0;
+uint32_t lastDecodedByteUs = 0;
+uint32_t lastDropSeen = 0;
 
-uint32_t makes = 0;
-uint32_t breaks = 0;
-uint32_t pauses = 0;
-
-uint32_t lastFall = 0;
 bool haveFall = false;
 
 uint8_t bitIndex = 0;
-uint8_t byteIn = 0;
-uint8_t parityIn = 0;
+uint8_t frameByte = 0;
+uint8_t parityBits = 0;
 
 bool prefixE0 = false;
 bool prefixF0 = false;
@@ -424,8 +487,8 @@ const uint8_t PAUSE_SEQ[8] = {
 
 void resetFrame() {
   bitIndex = 0;
-  byteIn = 0;
-  parityIn = 0;
+  frameByte = 0;
+  parityBits = 0;
 }
 
 void resetParser() {
@@ -434,233 +497,220 @@ void resetParser() {
   pauseIndex = 0;
 }
 
-void handleKey(
-  uint8_t code,
+void syncAfterPS2Error() {
+  resetFrame();
+  resetParser();
+  clearPhysicalKeys();
+
+  hidNeedsRelease = true;
+  ++resyncs;
+}
+
+void processKey(
+  uint8_t c,
   bool ext,
   bool down
 ) {
-  // Shift ficticio de Print Screen
-  if (ext && code == 0x12) return;
+  if (ext && c == 0x12) return;
+
+  uint16_t media = mediaUsage(c, ext);
+  uint8_t key = keyUsage(c, ext);
+
+  if (!media && !key) {
+    ++unmapped;
+
+    if (debugKeys) {
+      Serial.printf(
+        "[PS2] Sin mapa: %s%02X\n",
+        ext ? "E0 " : "",
+        c
+      );
+    }
+
+    return;
+  }
 
   if (down) ++makes;
   else ++breaks;
 
-  uint16_t media = consumerUsage(code, ext);
+  uint16_t index = c + (ext ? 256 : 0);
 
-  if (media) {
-    enqueueKey(media, down, true);
-    return;
+  if (down && !ps2Held[index]) {
+    ps2Held[index] = true;
+    ++physicalHeldCount;
+  }
+  else if (!down && ps2Held[index]) {
+    ps2Held[index] = false;
+    --physicalHeldCount;
   }
 
-  uint8_t usage = keyboardUsage(code, ext);
+  lastKeyMs = millis();
 
-  if (!usage) {
-    ++unmapped;
-
-    Serial.printf(
-      "[PS2] Sin mapa: %s%02X\n",
-      ext ? "E0 " : "",
-      code
-    );
-
-    return;
-  }
-
-  enqueueKey(usage, down);
+  addHID(
+    media ? media : key,
+    down,
+    media != 0
+  );
 
   if (debugKeys) {
     Serial.printf(
-      "[KEY] %s %s%02X -> %02X\n",
+      "[KEY] %s %s%02X\n",
       down ? "MAKE" : "BREAK",
       ext ? "E0 " : "",
-      code,
-      usage
+      c
     );
   }
 }
 
 // ====================================================
-// 7. COMANDOS PS/2 Y LED AUTOMATICOS
+// 8. CONTROL PS/2 DE LOS LED
 // ====================================================
 
-enum TxState : uint8_t {
-  TX_IDLE,
-  TX_WAIT_ECHO,
-  TX_WAIT_ED_ACK,
-  TX_READY_LED_VALUE,
-  TX_WAIT_LED_ACK
+enum CmdState : uint8_t {
+  CMD_IDLE,
+  CMD_WAIT_ECHO,
+  CMD_WAIT_ED_ACK,
+  CMD_SEND_MASK,
+  CMD_WAIT_MASK_ACK
 };
 
-TxState txState = TX_IDLE;
+CmdState cmdState = CMD_IDLE;
 
-bool echoRequested = false;
-bool ledRequested = false;
+bool wantEcho = false;
+bool wantLED = false;
 
-bool echoPassed = false;
-bool ledPassed = false;
-
+bool echoOK = false;
 bool autoLED = true;
 bool txBlocked = false;
 
-bool startupPending = false;
-uint32_t startupTime = 0;
+bool ledKnown = false;
+bool readyPrev = false;
 
-constexpr uint32_t AUTO_START_DELAY_MS = 1500;
+uint8_t ledTarget = 0;
+uint8_t ledConfirmed = 0;
+uint8_t lastObservedLED = 0;
 
-uint8_t requestedLED = 0;
-uint8_t confirmedLED = 0xFF;
+uint32_t ledObservedAt = 0;
+uint32_t commandStartedAt = 0;
+uint32_t connectedAt = 0;
 
-uint32_t txStartMs = 0;
-uint32_t commandOK = 0;
-uint32_t commandErrors = 0;
+uint32_t txOK = 0;
+uint32_t txErrors = 0;
 
-uint32_t lastLEDChangeMs = 0;
+uint8_t hostLEDMask() {
+  uint8_t v = 0;
 
-void resetLEDSync() {
-  echoRequested = false;
-  ledRequested = false;
+  if (keyboard.isScrollLockOn()) v |= 1;
+  if (keyboard.isNumLockOn()) v |= 2;
+  if (keyboard.isCapsLockOn()) v |= 4;
 
-  echoPassed = false;
-  ledPassed = false;
-
-  confirmedLED = 0xFF;
-
-  txState = TX_IDLE;
-  startupPending = false;
+  return v;
 }
 
-// Bits PS/2:
-// Scroll = 0x01
-// Num    = 0x02
-// Caps   = 0x04
-
-uint8_t readHostLEDs() {
-  uint8_t ps2mask = 0;
-
-  if (keyboard.isScrollLockOn()) {
-    ps2mask |= 0x01;
-  }
-
-  if (keyboard.isNumLockOn()) {
-    ps2mask |= 0x02;
-  }
-
-  if (keyboard.isCapsLockOn()) {
-    ps2mask |= 0x04;
-  }
-
-  return ps2mask;
-}
-
-void commandFailure(const char *reason) {
-  ++commandErrors;
+void commandError(const char *why) {
+  ++txErrors;
 
   txBlocked = true;
   autoLED = false;
 
-  echoRequested = false;
-  ledRequested = false;
-  startupPending = false;
+  wantEcho = false;
+  wantLED = false;
 
-  txState = TX_IDLE;
+  cmdState = CMD_IDLE;
 
   Serial.printf(
-    "[TX] ERROR: %s. Transmision DESACTIVADA.\n",
-    reason
+    "[TX] BLOQUEADO: %s\n",
+    why
   );
 
   Serial.println(
-    "[TX] Si el teclado deja de responder, "
-    "reiniciar alimentacion y usar V4.4."
+    "[TX] Nuevos comandos PS/2 deshabilitados."
   );
 }
 
-// ====================================================
-// 8. RESPUESTAS DEL CONTROLADOR CHICONY
-// ====================================================
+bool consumeCommandAnswer(uint8_t b) {
+  if (
+    cmdState == CMD_WAIT_ECHO &&
+    b == 0xEE
+  ) {
+    cmdState = CMD_IDLE;
+    echoOK = true;
+    ++txOK;
 
-bool consumeCommandResponse(uint8_t b) {
-  if (txState == TX_WAIT_ECHO && b == 0xEE) {
-    txState = TX_IDLE;
-    echoPassed = true;
-    ++commandOK;
+    ledKnown = false;
+    lastObservedLED = hostLEDMask();
+    ledObservedAt = millis();
 
-    Serial.println(
-      "[TX] ECHO RECIBIDO: 0xEE. Bidireccional OK."
-    );
-
-    // LED inicial automatico
-    if (autoLED && !txBlocked) {
-      requestedLED = readHostLEDs();
-      ledRequested = true;
-
-      Serial.printf(
-        "[AUTO] LED inicial = 0x%02X\n",
-        requestedLED
-      );
-    }
+    Serial.println("[TX] ECHO 0xEE correcto");
 
     return true;
   }
 
-  if (txState == TX_WAIT_ED_ACK && b == 0xFA) {
-    txState = TX_READY_LED_VALUE;
-    txStartMs = millis();
-
-    Serial.println(
-      "[TX] ACK 0xFA al comando 0xED."
-    );
+  if (
+    cmdState == CMD_WAIT_ED_ACK &&
+    b == 0xFA
+  ) {
+    cmdState = CMD_SEND_MASK;
+    commandStartedAt = millis();
 
     return true;
   }
 
-  if (txState == TX_WAIT_LED_ACK && b == 0xFA) {
-    txState = TX_IDLE;
-    ledPassed = true;
-    confirmedLED = requestedLED;
-    ++commandOK;
+  if (
+    cmdState == CMD_WAIT_MASK_ACK &&
+    b == 0xFA
+  ) {
+    cmdState = CMD_IDLE;
+
+    ledConfirmed = ledTarget;
+    ledKnown = true;
+
+    ++txOK;
 
     Serial.printf(
-      "[LED] OK mascara 0x%02X "
+      "[LED] OK 0x%02X "
       "(Caps=%d Num=%d Scroll=%d)\n",
-      confirmedLED,
-      !!(confirmedLED & 4),
-      !!(confirmedLED & 2),
-      !!(confirmedLED & 1)
-    );
-
-    return true;
-  }
-
-  if (b == 0xFE && txState != TX_IDLE) {
-    commandFailure(
-      "el teclado solicito RESEND 0xFE"
+      ledConfirmed,
+      !!(ledConfirmed & 4),
+      !!(ledConfirmed & 2),
+      !!(ledConfirmed & 1)
     );
 
     return true;
   }
 
   if (
+    b == 0xFE &&
+    cmdState != CMD_IDLE
+  ) {
+    commandError("PS/2 solicito RESEND");
+    return true;
+  }
+
+  return (
     b == 0xFA ||
     b == 0xFE ||
     b == 0xEE ||
     b == 0xAA
-  ) {
-    Serial.printf(
-      "[PS2] Respuesta aislada: 0x%02X\n",
-      b
-    );
-
-    return true;
-  }
-
-  return false;
+  );
 }
 
-void receiveByte(uint8_t b) {
-  if (consumeCommandResponse(b)) return;
+void processPS2Byte(uint8_t b) {
+  uint32_t now = micros();
 
-  // Pause
+  if (
+    lastDecodedByteUs &&
+    (uint32_t)(
+      now - lastDecodedByteUs
+    ) > 100000
+  ) {
+    resetParser();
+  }
+
+  lastDecodedByteUs = now;
+
+  if (consumeCommandAnswer(b)) return;
+
   if (pauseIndex || b == 0xE1) {
     if (b == PAUSE_SEQ[pauseIndex]) {
       ++pauseIndex;
@@ -669,10 +719,11 @@ void receiveByte(uint8_t b) {
         pauseIndex = 0;
         ++pauses;
 
-        enqueueKey(0x48, true);
-        enqueueKey(0x48, false);
+        addHID(0x48, true);
+        addHID(0x48, false);
       }
-    } else {
+    }
+    else {
       resetParser();
     }
 
@@ -695,31 +746,20 @@ void receiveByte(uint8_t b) {
   prefixE0 = false;
   prefixF0 = false;
 
-  handleKey(b, ext, down);
+  processKey(b, ext, down);
 }
 
-// ====================================================
-// 9. RECONSTRUCCION DE TRAMAS PS/2
-// ====================================================
-
-void fallingEdge(const PS2Edge &e) {
-  ++falls;
-
+void processFall(const PS2Edge &e) {
   if (haveFall) {
-    uint32_t dt = e.us - lastFall;
-
-    if (dt < 65) {
-      ++shortClocks;
-    }
+    uint32_t dt = e.timeUs - lastFallUs;
 
     if (dt > 300 && bitIndex != 0) {
       ++cutFrames;
-      resetFrame();
-      resetParser();
+      syncAfterPS2Error();
     }
   }
 
-  lastFall = e.us;
+  lastFallUs = e.timeUs;
   haveFall = true;
 
   uint8_t bit = e.data & 1;
@@ -730,18 +770,17 @@ void fallingEdge(const PS2Edge &e) {
       return;
     }
 
-    byteIn = 0;
-    parityIn = 0;
+    frameByte = 0;
+    parityBits = 0;
   }
   else if (bitIndex <= 8) {
-    byteIn |= (uint8_t)(
-      bit << (bitIndex - 1)
-    );
+    frameByte |=
+      (uint8_t)(bit << (bitIndex - 1));
 
-    parityIn ^= bit;
+    parityBits ^= bit;
   }
   else if (bitIndex == 9) {
-    parityIn ^= bit;
+    parityBits ^= bit;
   }
 
   ++bitIndex;
@@ -749,46 +788,56 @@ void fallingEdge(const PS2Edge &e) {
   if (bitIndex == 11) {
     if (!bit) {
       ++badStop;
-      resetParser();
+      syncAfterPS2Error();
     }
-    else if (parityIn != 1) {
+    else if (parityBits != 1) {
       ++badParity;
-      resetParser();
+      syncAfterPS2Error();
     }
     else {
-      ++validBytes;
-      receiveByte(byteIn);
+      ++bytesOK;
+      processPS2Byte(frameByte);
     }
 
     resetFrame();
   }
 }
 
-void drainPS2() {
-  PS2Edge e;
-  uint16_t n = 0;
+void servicePS2() {
+  uint32_t nDrops;
 
-  while (n < 512 && popEdge(e)) {
-    if (e.clk == 0) {
-      fallingEdge(e);
-    } else {
-      ++rises;
+  noInterrupts();
+  nDrops = edgeDrops;
+  interrupts();
+
+  if (nDrops != lastDropSeen) {
+    lastDropSeen = nDrops;
+
+    noInterrupts();
+    edgeR = edgeW;
+    interrupts();
+
+    syncAfterPS2Error();
+  }
+
+  PS2Edge e;
+  uint16_t count = 0;
+
+  while (
+    count < 512 &&
+    popEdge(e)
+  ) {
+    if (e.clock == LOW) {
+      processFall(e);
     }
 
-    ++n;
+    ++count;
   }
 }
 
 // ====================================================
-// 10. TRANSMISOR PS/2
+// 9. TRANSMISOR PS/2
 // ====================================================
-
-// Conservamos la transmision de la V4.3.
-//
-// LOW  = conectar linea a tierra.
-// HIGH = soltar linea.
-//
-// Utilizamos drenador abierto.
 
 bool waitPin(
   uint8_t pin,
@@ -798,9 +847,11 @@ bool waitPin(
   uint32_t start = micros();
 
   while (digitalRead(pin) != level) {
-    if ((uint32_t)(
-      micros() - start
-    ) >= timeoutUs) {
+    if (
+      (uint32_t)(
+        micros() - start
+      ) >= timeoutUs
+    ) {
       return false;
     }
   }
@@ -808,407 +859,392 @@ bool waitPin(
   return true;
 }
 
-bool busQuiet() {
-  if (bitIndex != 0) return false;
-  if (edgeR != edgeW) return false;
-  if (hidR != hidW) return false;
+bool electricalBusIdle(uint32_t quietUs) {
+  if (
+    bitIndex != 0 ||
+    edgeR != edgeW ||
+    transmitting
+  ) {
+    return false;
+  }
 
   if (
-    digitalRead(CLOCK_PIN) != HIGH ||
-    digitalRead(DATA_PIN) != HIGH
+    digitalRead(PIN_CLOCK) != HIGH ||
+    digitalRead(PIN_DATA) != HIGH
   ) {
     return false;
   }
 
   return (
     (uint32_t)(
-      micros() - lastEdgeIRQ
-    ) > 5000
+      micros() - lastEdgeUs
+    ) > quietUs
   );
 }
 
-bool sendHostByte(uint8_t b) {
-  if (!busQuiet()) return false;
+bool readyForNewCommand() {
+  return (
+    electricalBusIdle(PS2_TX_QUIET_US) &&
+    physicalHeldCount == 0 &&
+    hidR == hidW
+  );
+}
 
-  hostTransmitting = true;
+bool sendPS2Byte(uint8_t b) {
+  if (!electricalBusIdle(3000)) {
+    return false;
+  }
 
-  digitalWrite(CLOCK_PIN, HIGH);
-  digitalWrite(DATA_PIN, HIGH);
+  transmitting = true;
 
-  pinMode(CLOCK_PIN, OUTPUT_OPEN_DRAIN);
-  pinMode(DATA_PIN, OUTPUT_OPEN_DRAIN);
+  digitalWrite(PIN_CLOCK, HIGH);
+  digitalWrite(PIN_DATA, HIGH);
 
-  digitalWrite(CLOCK_PIN, HIGH);
-  digitalWrite(DATA_PIN, HIGH);
+  pinMode(
+    PIN_CLOCK,
+    OUTPUT_OPEN_DRAIN
+  );
+
+  pinMode(
+    PIN_DATA,
+    OUTPUT_OPEN_DRAIN
+  );
+
+  digitalWrite(PIN_CLOCK, HIGH);
+  digitalWrite(PIN_DATA, HIGH);
 
   bool ok = true;
 
-  // Inhibit
-  digitalWrite(CLOCK_PIN, LOW);
+  digitalWrite(PIN_CLOCK, LOW);
   delayMicroseconds(160);
 
-  // Request to send
-  digitalWrite(DATA_PIN, LOW);
+  digitalWrite(PIN_DATA, LOW);
   delayMicroseconds(15);
 
-  digitalWrite(CLOCK_PIN, HIGH);
+  digitalWrite(PIN_CLOCK, HIGH);
 
-  if (!waitPin(CLOCK_PIN, LOW, 15000)) {
+  if (!waitPin(PIN_CLOCK, LOW, 15000)) {
     ok = false;
   }
 
-  // 8 bits + paridad impar
   uint8_t oddParity = 1;
 
-  for (uint8_t i = 0; i < 9 && ok; ++i) {
+  for (
+    uint8_t i = 0;
+    i < 9 && ok;
+    ++i
+  ) {
     uint8_t bit;
 
     if (i < 8) {
       bit = (b >> i) & 1;
       oddParity ^= bit;
-    } else {
+    }
+    else {
       bit = oddParity;
     }
 
     digitalWrite(
-      DATA_PIN,
+      PIN_DATA,
       bit ? HIGH : LOW
     );
 
-    if (!waitPin(CLOCK_PIN, HIGH, 2000)) {
+    if (!waitPin(PIN_CLOCK, HIGH, 2000)) {
       ok = false;
       break;
     }
 
-    if (!waitPin(CLOCK_PIN, LOW, 2000)) {
+    if (!waitPin(PIN_CLOCK, LOW, 2000)) {
       ok = false;
       break;
     }
   }
 
   if (ok) {
-    // STOP y ACK electrico
-    digitalWrite(DATA_PIN, HIGH);
+    digitalWrite(PIN_DATA, HIGH);
 
-    if (!waitPin(CLOCK_PIN, HIGH, 2000)) {
+    if (!waitPin(PIN_CLOCK, HIGH, 2000)) {
       ok = false;
     }
 
-    if (ok && !waitPin(DATA_PIN, LOW, 2000)) {
+    if (
+      ok &&
+      !waitPin(PIN_DATA, LOW, 2000)
+    ) {
       ok = false;
     }
 
-    if (ok && !waitPin(CLOCK_PIN, LOW, 2000)) {
+    if (
+      ok &&
+      !waitPin(PIN_CLOCK, LOW, 2000)
+    ) {
       ok = false;
     }
 
-    if (ok && !waitPin(CLOCK_PIN, HIGH, 2000)) {
+    if (
+      ok &&
+      !waitPin(PIN_CLOCK, HIGH, 2000)
+    ) {
       ok = false;
     }
 
-    if (ok && !waitPin(DATA_PIN, HIGH, 2000)) {
+    if (
+      ok &&
+      !waitPin(PIN_DATA, HIGH, 2000)
+    ) {
       ok = false;
     }
   }
 
-  // Liberar SIEMPRE ambas lineas.
-  digitalWrite(DATA_PIN, HIGH);
-  digitalWrite(CLOCK_PIN, HIGH);
+  digitalWrite(PIN_DATA, HIGH);
+  digitalWrite(PIN_CLOCK, HIGH);
 
-  pinMode(DATA_PIN, INPUT_PULLUP);
-  pinMode(CLOCK_PIN, INPUT_PULLUP);
+  pinMode(PIN_DATA, INPUT_PULLUP);
+  pinMode(PIN_CLOCK, INPUT_PULLUP);
 
   resetFrame();
   resetParser();
-
   haveFall = false;
-  lastEdgeIRQ = micros();
 
-  hostTransmitting = false;
+  lastEdgeUs = micros();
+  transmitting = false;
 
   return ok;
 }
 
 // ====================================================
-// 11. MAQUINA DE ESTADOS DE COMANDOS PS/2
+// 10. CONTROL AUTOMATICO DE LED
 // ====================================================
 
-void servicePS2Commands() {
+void serviceCommands() {
   if (txBlocked) return;
 
-  if (
-    txState == TX_WAIT_ECHO ||
-    txState == TX_WAIT_ED_ACK ||
-    txState == TX_WAIT_LED_ACK
-  ) {
-    if ((uint32_t)(
-      millis() - txStartMs
-    ) > 100) {
-      commandFailure(
-        "respuesta PS/2 fuera de plazo"
-      );
-    }
-
-    return;
-  }
-
-  if (txState == TX_READY_LED_VALUE) {
-    if ((uint32_t)(
-      millis() - txStartMs
-    ) > 250) {
-      commandFailure(
-        "bus ocupado esperando byte de LED"
-      );
-      return;
-    }
-
-    if (!busQuiet()) return;
-
-    if (!sendHostByte(requestedLED)) {
-      commandFailure(
-        "envio del byte de LED fallo"
-      );
-      return;
-    }
-
-    txState = TX_WAIT_LED_ACK;
-    txStartMs = millis();
-
-    Serial.printf(
-      "[TX] Mascara LED 0x%02X enviada.\n",
-      requestedLED
-    );
-
-    return;
-  }
+  uint32_t now = millis();
 
   if (
-    !keyboard.isConnected() ||
-    !keyboard.isPaired()
+    cmdState == CMD_WAIT_ECHO ||
+    cmdState == CMD_WAIT_ED_ACK ||
+    cmdState == CMD_WAIT_MASK_ACK
+  ) {
+    if (
+      (uint32_t)(
+        now - commandStartedAt
+      ) > CMD_TIMEOUT_MS
+    ) {
+      commandError("sin respuesta del teclado");
+    }
+
+    return;
+  }
+
+  if (cmdState == CMD_SEND_MASK) {
+    if (
+      (uint32_t)(
+        now - commandStartedAt
+      ) > LED_PARAM_TIMEOUT_MS
+    ) {
+      commandError(
+        "no fue posible completar 0xED"
+      );
+
+      return;
+    }
+
+    if (!electricalBusIdle(3000)) return;
+
+    if (!sendPS2Byte(ledTarget)) {
+      commandError(
+        "fallo envio mascara LED"
+      );
+
+      return;
+    }
+
+    cmdState = CMD_WAIT_MASK_ACK;
+    commandStartedAt = millis();
+
+    return;
+  }
+
+  if (!readyPrev) return;
+
+  if (wantEcho) {
+    if (!readyForNewCommand()) return;
+
+    wantEcho = false;
+
+    if (!sendPS2Byte(0xEE)) {
+      commandError("fallo envio ECHO");
+      return;
+    }
+
+    cmdState = CMD_WAIT_ECHO;
+    commandStartedAt = millis();
+
+    return;
+  }
+
+  if (
+    !echoOK ||
+    (!autoLED && !wantLED)
   ) {
     return;
   }
 
-  if (!busQuiet()) return;
+  uint8_t newMask = hostLEDMask();
 
-  // Diagnostico ECHO
-  if (echoRequested) {
-    echoRequested = false;
-
-    if (!sendHostByte(0xEE)) {
-      commandFailure(
-        "envio ECHO 0xEE fallo"
-      );
-      return;
-    }
-
-    txState = TX_WAIT_ECHO;
-    txStartMs = millis();
-
-    Serial.println(
-      "[TX] ECHO enviado. Esperando 0xEE..."
-    );
-
-    return;
+  if (newMask != lastObservedLED) {
+    lastObservedLED = newMask;
+    ledObservedAt = now;
   }
 
-  if (!echoPassed) return;
-
-  // Sincronizacion automatica
   if (
     autoLED &&
-    ledPassed &&
+    (!ledKnown || newMask != ledConfirmed) &&
     (uint32_t)(
-      millis() - lastLEDChangeMs
-    ) > 350
+      now - ledObservedAt
+    ) >= LED_STABLE_MS
   ) {
-    uint8_t desired = readHostLEDs();
-
-    if (desired != confirmedLED) {
-      requestedLED = desired;
-      ledRequested = true;
-      lastLEDChangeMs = millis();
-    }
+    wantLED = true;
   }
 
-  if (!ledRequested) return;
+  if (!wantLED) return;
 
-  ledRequested = false;
+  if (!readyForNewCommand()) return;
 
-  if (!sendHostByte(0xED)) {
-    commandFailure(
-      "envio 0xED fallo"
-    );
+  wantLED = false;
+  ledTarget = newMask;
+
+  if (!sendPS2Byte(0xED)) {
+    commandError("fallo envio 0xED");
     return;
   }
 
-  txState = TX_WAIT_ED_ACK;
-  txStartMs = millis();
-
-  Serial.printf(
-    "[TX] 0xED enviado. Objetivo=0x%02X\n",
-    requestedLED
-  );
+  cmdState = CMD_WAIT_ED_ACK;
+  commandStartedAt = millis();
 }
 
 // ====================================================
-// 12. CONEXION BLUETOOTH Y LED AUTOMATICOS
+// 11. CONEXION BLE
 // ====================================================
 
-void serviceAutoStartup() {
-  static bool prevReady = false;
-
+void serviceConnection() {
   bool ready =
     keyboard.isConnected() &&
     keyboard.isPaired();
 
-  if (ready && !prevReady) {
-    Serial.println(
-      "[AUTO] Bluetooth listo."
-    );
+  if (ready != readyPrev) {
+    readyPrev = ready;
 
-    if (!txBlocked) {
-      resetLEDSync();
-
-      autoLED = true;
-      startupPending = true;
-      startupTime = millis();
-
-      Serial.println(
-        "[AUTO] Esperando antes de probar ECHO."
-      );
-    }
-  }
-
-  if (!ready && prevReady) {
-    Serial.println(
-      "[AUTO] Bluetooth desconectado."
-    );
-
-    autoLED = false;
-
-    startupPending = false;
-    echoRequested = false;
-    ledRequested = false;
-
-    if (txState != TX_IDLE) {
-      commandFailure(
-        "Bluetooth desconectado durante comando PS/2"
-      );
-    } else {
-      echoPassed = false;
-      ledPassed = false;
-      confirmedLED = 0xFF;
-    }
-  }
-
-  prevReady = ready;
-
-  if (!ready || txBlocked || !startupPending) {
-    return;
-  }
-
-  if ((uint32_t)(
-    millis() - startupTime
-  ) < AUTO_START_DELAY_MS) {
-    return;
-  }
-
-  if (txState != TX_IDLE) return;
-
-  startupPending = false;
-  echoRequested = true;
-
-  Serial.println(
-    "[AUTO] Solicitando ECHO 0xEE."
-  );
-}
-
-// ====================================================
-// 13. ENVIO HID BLUETOOTH OPTIMIZADO
-// ====================================================
-
-void serviceHID() {
-  static bool wasPaired = false;
-  static uint32_t lastSend = 0;
-
-  bool ready = keyboard.isPaired();
-
-  if (ready != wasPaired) {
-    wasPaired = ready;
-    resetHID();
+    clearHIDQueue();
 
     if (ready) {
       keyboard.releaseAll();
 
+      connectedAt = millis();
+
+      echoOK = false;
+      ledKnown = false;
+
+      lastObservedLED = hostLEDMask();
+      ledObservedAt = millis();
+
+      wantEcho = false;
+      wantLED = false;
+
       Serial.println(
-        "[BLE] Emparejado y listo"
-      );
-    } else {
-      Serial.println(
-        "[BLE] Enlace no listo"
+        "[BLE] Lista. Preparando sincronizacion."
       );
     }
+    else {
+      if (cmdState != CMD_IDLE) {
+        commandError(
+          "desconexion durante comando PS/2"
+        );
+      }
 
-    lastSend = millis();
+      echoOK = false;
+      ledKnown = false;
+
+      wantEcho = false;
+      wantLED = false;
+
+      Serial.println("[BLE] Desconectada.");
+    }
   }
 
-  if (!ready) return;
+  if (
+    ready &&
+    !txBlocked &&
+    !echoOK &&
+    cmdState == CMD_IDLE &&
+    !wantEcho &&
+    (uint32_t)(
+      millis() - connectedAt
+    ) >= BLE_SETTLE_MS
+  ) {
+    wantEcho = true;
+  }
+}
 
-  if (needResync) {
+// ====================================================
+// 12. ENVIO HID
+// ====================================================
+
+void serviceHID() {
+  if (!readyPrev) return;
+
+  if (hidNeedsRelease) {
     keyboard.releaseAll();
-    resetHID();
+    clearHIDQueue();
 
-    lastSend = millis();
     return;
   }
 
-  // NUEVO:
-  // Usar intervalo seleccionable.
+  static uint32_t lastSendMs = 0;
+
   if (
     (uint32_t)(
-      millis() - lastSend
+      millis() - lastSendMs
     ) < hidGapMs ||
     hidR == hidW
   ) {
     return;
   }
 
-  HIDEvent e = hidQ[hidR];
+  HIDEvent e = hidEvents[hidR];
+
   hidR = (hidR + 1) & HID_MASK;
 
-  // NUEVO: medir espera del evento.
-  uint32_t waited =
-    (uint32_t)(millis() - e.queuedMs);
+  uint32_t waitMs = millis() - e.queuedMs;
 
-  if (waited > hidMaxWaitMs) {
-    hidMaxWaitMs = waited;
+  if (waitMs > maxQueueWaitMs) {
+    maxQueueWaitMs = waitMs;
   }
 
-  hidWaitSumMs += waited;
-  ++hidWaitSamples;
+  sumQueueWaitMs += waitMs;
+  ++queueSamples;
 
   if (e.media) {
     if (e.down) {
-      if (activeMedia == e.usage) {
-        ++hidIgnored;
+      if (mediaHeld == e.usage) {
+        ++ignored;
         return;
       }
 
-      if (activeMedia != 0) {
-        keyboard.release(
-          (uint16_t)activeMedia
-        );
+      if (mediaHeld) {
+        keyboard.release(mediaHeld);
       }
 
-      activeMedia = e.usage;
+      mediaHeld = e.usage;
 
       keyboard.press(
         (uint16_t)e.usage
       );
-    } else {
-      if (activeMedia != e.usage) {
-        ++hidIgnored;
+    }
+    else {
+      if (mediaHeld != e.usage) {
+        ++ignored;
         return;
       }
 
@@ -1216,129 +1252,424 @@ void serviceHID() {
         (uint16_t)e.usage
       );
 
-      activeMedia = 0;
+      mediaHeld = 0;
     }
-  } else {
+  }
+  else {
     uint8_t u = (uint8_t)e.usage;
 
-    if (held[u] == e.down) {
-      ++hidIgnored;
+    if (hidHeld[u] == e.down) {
+      ++ignored;
       return;
     }
 
-    held[u] = e.down;
+    hidHeld[u] = e.down;
 
     if (e.down) {
       keyboard.press(u);
-    } else {
+    }
+    else {
       keyboard.release(u);
     }
   }
 
   ++hidSent;
-  lastSend = millis();
+  lastSendMs = millis();
 }
 
 // ====================================================
-// 14. ESTADISTICAS
+// 13. NUEVA FUNCION: KEEP-ALIVE
+// ====================================================
+
+// No crea conexiones USB falsas.
+// Solo intenta incrementar el consumo electrico
+// del propio ESP32 durante una ventana periodica.
+//
+// Cada porcion de calculo dura aproximadamente
+// 1.5 ms para no bloquear el loop durante segundos.
+//
+// NO enviar comandos PS/2 desde aqui.
+// NO alterar las teclas HID.
+
+void serviceKeepAlive() {
+  if (!keepAliveEnabled) return;
+
+  uint32_t now = millis();
+
+  if (!keepAliveActive) {
+    if (
+      (uint32_t)(
+        now - keepWindowStartMs
+      ) >= KEEP_INTERVAL_MS
+    ) {
+      keepAliveActive = true;
+      keepPulseStartMs = now;
+      ++keepPulseCount;
+
+      Serial.printf(
+        "[KEEP] Pulso %lu iniciado\n",
+        (unsigned long)keepPulseCount
+      );
+    }
+
+    return;
+  }
+
+  if (
+    (uint32_t)(
+      now - keepPulseStartMs
+    ) >= KEEP_DURATION_MS
+  ) {
+    keepAliveActive = false;
+    keepWindowStartMs = now;
+
+    Serial.println("[KEEP] Pulso terminado");
+    return;
+  }
+
+  // Calculo que el compilador no puede
+  // eliminar como operacion inutil.
+
+  uint32_t startUs = micros();
+  uint32_t value = keepCalculation;
+
+  while (
+    (uint32_t)(
+      micros() - startUs
+    ) < KEEP_SLICE_US
+  ) {
+    value = value * 1664525UL + 1013904223UL;
+    value ^= (value >> 13);
+  }
+
+  keepCalculation = value;
+}
+
+// ====================================================
+// 14. WATCHDOG
+// ====================================================
+
+bool watchdogEnabled = false;
+
+void setupWatchdog() {
+  esp_task_wdt_config_t cfg = {};
+
+  cfg.timeout_ms = 15000;
+  cfg.idle_core_mask = 0;
+  cfg.trigger_panic = true;
+
+  esp_err_t rc = esp_task_wdt_init(&cfg);
+
+  if (rc == ESP_ERR_INVALID_STATE) {
+    rc = esp_task_wdt_reconfigure(&cfg);
+  }
+
+  if (rc == ESP_OK) {
+    rc = esp_task_wdt_add(NULL);
+
+    if (
+      rc == ESP_OK ||
+      rc == ESP_ERR_INVALID_STATE
+    ) {
+      watchdogEnabled = true;
+    }
+  }
+
+  Serial.printf(
+    "[WDT] %s (15 segundos)\n",
+    watchdogEnabled ? "activo" : "no disponible"
+  );
+}
+
+// ====================================================
+// 15. REINICIOS
+// ====================================================
+
+const char *resetName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "POWER_ON";
+    case ESP_RST_SW: return "SOFTWARE";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_USB: return "USB";
+
+    default: return "OTRO";
+  }
+}
+
+// ====================================================
+// 16. ESTADISTICAS
 // ====================================================
 
 void printStats() {
-  uint32_t drops;
+  uint32_t dropped;
 
   noInterrupts();
-  drops = edgeDrops;
+  dropped = edgeDrops;
   interrupts();
 
+  uint16_t pending =
+    (hidW - hidR) & HID_MASK;
+
+  uint32_t average = queueSamples
+    ? (uint32_t)(
+        sumQueueWaitMs / queueSamples
+      )
+    : 0;
+
   Serial.println();
-  Serial.println("===== HP KB9970 V4.5 =====");
+  Serial.println("===== HP KB9970 V4.6.2 =====");
 
   Serial.printf(
-    "[PS2] OK=%lu MAKE=%lu BREAK=%lu "
-    "START=%lu PARITY=%lu STOP=%lu "
-    "CUT=%lu DROP=%lu\n",
-    (unsigned long)validBytes,
+    "[BLE] CONNECTED=%d PAIRED=%d READY=%d\n",
+    keyboard.isConnected(),
+    keyboard.isPaired(),
+    readyPrev
+  );
+
+  Serial.printf(
+    "[PS2] BYTES=%lu MAKE=%lu BREAK=%lu "
+    "ERR_START=%lu ERR_PAR=%lu ERR_STOP=%lu "
+    "CUT=%lu DROPS=%lu RESYNC=%lu\n",
+    (unsigned long)bytesOK,
     (unsigned long)makes,
     (unsigned long)breaks,
     (unsigned long)badStart,
     (unsigned long)badParity,
     (unsigned long)badStop,
     (unsigned long)cutFrames,
-    (unsigned long)drops
+    (unsigned long)dropped,
+    (unsigned long)resyncs
   );
 
   Serial.printf(
-    "[CLOCK] BAJADAS=%lu SUBIDAS=%lu "
-    "CORTOS=%lu\n",
-    (unsigned long)falls,
-    (unsigned long)rises,
-    (unsigned long)shortClocks
-  );
-
-  Serial.printf(
-    "[BLE] CONECTADO=%d PAIRED=%d "
-    "REPORTES=%lu HID_PERDIDOS=%lu\n",
-    keyboard.isConnected(),
-    keyboard.isPaired(),
-    (unsigned long)hidSent,
-    (unsigned long)hidDrops
-  );
-
-  uint16_t pending =
-    (hidW - hidR) & HID_MASK;
-
-  uint32_t avg = hidWaitSamples
-    ? (uint32_t)(
-        hidWaitSumMs / hidWaitSamples
-      )
-    : 0;
-
-  Serial.printf(
-    "[HID] GAP=%u ms PENDIENTES=%u "
-    "PICO=%u ESPERA_PROM=%lu ms "
-    "ESPERA_MAX=%lu ms IGNORADOS=%lu\n",
+    "[HID] GAP=%u SENT=%lu DROP=%lu "
+    "PENDING=%u PEAK=%u "
+    "AVG_WAIT=%lu MAX_WAIT=%lu HELD_PS2=%u\n",
     (unsigned)hidGapMs,
+    (unsigned long)hidSent,
+    (unsigned long)hidDrops,
     (unsigned)pending,
-    (unsigned)hidPeakQueue,
-    (unsigned long)avg,
-    (unsigned long)hidMaxWaitMs,
-    (unsigned long)hidIgnored
+    (unsigned)maxQueue,
+    (unsigned long)average,
+    (unsigned long)maxQueueWaitMs,
+    (unsigned)physicalHeldCount
   );
 
   Serial.printf(
-    "[HOST] CAPS=%d NUM=%d SCROLL=%d "
-    "PS2_MASK=0x%02X\n",
-    keyboard.isCapsLockOn(),
-    keyboard.isNumLockOn(),
-    keyboard.isScrollLockOn(),
-    readHostLEDs()
-  );
-
-  Serial.printf(
-    "[TX] ESTADO=%u ECHO_OK=%d LED_OK=%d "
-    "AUTO=%d BLOQUEADO=%d CONFIRMADO=0x%02X "
-    "OK=%lu ERRORES=%lu\n",
-    (unsigned)txState,
-    echoPassed,
-    ledPassed,
+    "[LED] HOST=%02X CONFIRMED=%02X "
+    "KNOWN=%d AUTO=%d ECHO=%d "
+    "TX_BLOCK=%d OK=%lu ERROR=%lu STATE=%u\n",
+    hostLEDMask(),
+    ledConfirmed,
+    ledKnown,
     autoLED,
+    echoOK,
     txBlocked,
-    confirmedLED,
-    (unsigned long)commandOK,
-    (unsigned long)commandErrors
+    (unsigned long)txOK,
+    (unsigned long)txErrors,
+    (unsigned)cmdState
+  );
+
+  Serial.printf(
+    "[KEEP] ENABLED=%d ACTIVE=%d "
+    "PULSES=%lu INTERVAL=%lu ms "
+    "DURATION=%lu ms\n",
+    keepAliveEnabled,
+    keepAliveActive,
+    (unsigned long)keepPulseCount,
+    (unsigned long)KEEP_INTERVAL_MS,
+    (unsigned long)KEEP_DURATION_MS
+  );
+
+  Serial.printf(
+    "[SYS] FREE_HEAP=%lu MIN_HEAP=%lu "
+    "UPTIME=%lu s WDT=%d\n",
+    (unsigned long)ESP.getFreeHeap(),
+    (unsigned long)ESP.getMinFreeHeap(),
+    (unsigned long)(millis() / 1000),
+    watchdogEnabled
   );
 }
 
 // ====================================================
-// 15. SETUP
+// 17. COMANDOS SERIE
+// ====================================================
+
+void printHelp() {
+  Serial.println();
+  Serial.println("=== COMANDOS ===");
+  Serial.println("s = estadisticas");
+  Serial.println("d = debug PS/2");
+  Serial.println("h = ayuda");
+  Serial.println("1 = HID 20 ms");
+  Serial.println("2 = HID 12 ms");
+  Serial.println("3 = HID 8 ms");
+  Serial.println("e = ECHO PS/2");
+  Serial.println("l = sincronizar LED");
+  Serial.println("a = alternar LED automatico");
+  Serial.println("b = reiniciar Bluetooth");
+  Serial.println("r = reiniciar ESP32");
+
+  Serial.println("k = alternar KEEP-ALIVE");
+  Serial.println("p = provocar un pulso KEEP-ALIVE");
+
+  Serial.println();
+}
+
+void serialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == 's') {
+      printStats();
+    }
+    else if (c == 'h') {
+      printHelp();
+    }
+    else if (c == 'd') {
+      debugKeys = !debugKeys;
+
+      Serial.printf(
+        "[DEBUG] %d\n",
+        debugKeys
+      );
+    }
+    else if (c >= '1' && c <= '3') {
+      hidGapMs =
+        c == '1' ? 20 :
+        c == '2' ? 12 : 8;
+
+      Serial.printf(
+        "[HID] GAP=%u ms\n",
+        (unsigned)hidGapMs
+      );
+    }
+    else if (c == 'k') {
+      keepAliveEnabled = !keepAliveEnabled;
+
+      if (!keepAliveEnabled) {
+        keepAliveActive = false;
+      }
+
+      keepWindowStartMs = millis();
+
+      Serial.printf(
+        "[KEEP] ENABLED=%d\n",
+        keepAliveEnabled
+      );
+    }
+    else if (c == 'p') {
+      keepAliveEnabled = true;
+      keepAliveActive = true;
+      keepPulseStartMs = millis();
+
+      ++keepPulseCount;
+
+      Serial.println(
+        "[KEEP] Pulso manual iniciado"
+      );
+    }
+    else if (
+      c == 'e' &&
+      !txBlocked &&
+      cmdState == CMD_IDLE
+    ) {
+      wantEcho = true;
+
+      Serial.println(
+        "[TX] ECHO solicitado"
+      );
+    }
+    else if (
+      c == 'l' &&
+      !txBlocked &&
+      echoOK &&
+      cmdState == CMD_IDLE
+    ) {
+      wantLED = true;
+
+      Serial.println(
+        "[LED] Sincronizacion solicitada"
+      );
+    }
+    else if (
+      c == 'a' &&
+      !txBlocked
+    ) {
+      autoLED = !autoLED;
+
+      Serial.printf(
+        "[LED] Automatico=%d\n",
+        autoLED
+      );
+    }
+    else if (c == 'b') {
+      if (cmdState != CMD_IDLE) {
+        Serial.println(
+          "[BLE] Esperar a terminar PS/2"
+        );
+      }
+      else {
+        Serial.println(
+          "[BLE] Reinicio manual"
+        );
+
+        keyboard.end();
+        delay(150);
+        keyboard.begin();
+      }
+    }
+    else if (c == 'r') {
+      Serial.println(
+        "[SYS] Reinicio manual"
+      );
+
+      Serial.flush();
+      ESP.restart();
+    }
+  }
+}
+
+// ====================================================
+// 18. SETUP
 // ====================================================
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(300);
 
-  pinMode(DATA_PIN, INPUT_PULLUP);
-  pinMode(CLOCK_PIN, INPUT_PULLUP);
+  esp_reset_reason_t cause =
+    esp_reset_reason();
+
+  Serial.printf(
+    "\nHP KB9970 V4.6.2 - REINICIO: %s (%d)\n",
+    resetName(cause),
+    (int)cause
+  );
+
+  pinMode(PIN_DATA, INPUT_PULLUP);
+  pinMode(PIN_CLOCK, INPUT_PULLUP);
+
+  setupWatchdog();
+
+  if (
+    cause == ESP_RST_TASK_WDT ||
+    cause == ESP_RST_INT_WDT ||
+    cause == ESP_RST_WDT ||
+    cause == ESP_RST_PANIC ||
+    cause == ESP_RST_BROWNOUT
+  ) {
+    autoLED = false;
+    txBlocked = true;
+
+    Serial.println(
+      "[SAFE] TX PS/2 bloqueada por reinicio anormal."
+    );
+  }
 
   keyboard.setLogLevel(
     HIDLogLevel::Normal
@@ -1349,157 +1680,61 @@ void setup() {
   );
 
   keyboard.setConnIntervalMs(30);
-  keyboard.onPairingComplete(paired);
+  keyboard.onPairingComplete(pairingDone);
   keyboard.begin();
 
   attachInterrupt(
-    digitalPinToInterrupt(CLOCK_PIN),
-    onClockEdge,
+    digitalPinToInterrupt(PIN_CLOCK),
+    clockISR,
     CHANGE
   );
 
-  Serial.println();
-  Serial.println("HP KB9970 BLUETOOTH V4.5");
+  // Programar primer pulso.
+  keepWindowStartMs = millis();
 
   Serial.println(
-    "LED automaticos / HID configurable"
+    "[CONFIG] HID 8 ms - KEEP-ALIVE ACTIVO"
   );
 
-  Serial.println(
-    "Nombre Bluetooth: HP KB9970 V3"
-  );
-
-  Serial.println("Comandos:");
-  Serial.println("1 = conservador, 20 ms");
-  Serial.println("2 = rapido, 12 ms");
-  Serial.println("3 = experimental, 8 ms");
-  Serial.println("s = estadisticas");
-  Serial.println("d = debug");
-  Serial.println("e = ECHO");
-  Serial.println("l = LED manual");
-  Serial.println("a = LED automatico ON/OFF");
+  printHelp();
 }
 
 // ====================================================
-// 16. LOOP
+// 19. LOOP PRINCIPAL
 // ====================================================
 
 void loop() {
-  drainPS2();
+  // Atender primero la entrada fisica.
+  servicePS2();
+
+  // Mantener conexion BLE.
+  serviceConnection();
+
+  // Enviar eventos HID.
   serviceHID();
-  serviceAutoStartup();
-  servicePS2Commands();
 
-  if (pairingResult != -1) {
-    int8_t result = pairingResult;
-    pairingResult = -1;
+  // Controlar luces originales.
+  serviceCommands();
 
-    Serial.println(
-      result
-        ? "[BLE] Pairing OK"
-        : "[BLE] Pairing fallo"
+  // Gestionar comandos de diagnostico.
+  serialCommands();
+
+  // Actividad periodica para intentar mantener
+  // encendida la salida de 5 V del power bank.
+  serviceKeepAlive();
+
+  if (pairingStatus != -1) {
+    int8_t result = pairingStatus;
+    pairingStatus = -1;
+
+    Serial.printf(
+      "[BLE] PAIRING=%s\n",
+      result ? "OK" : "ERROR"
     );
   }
 
-  while (Serial.available()) {
-    char c = Serial.read();
-
-    if (c == 's' || c == 'S') {
-      printStats();
-    }
-
-    if (c == 'd' || c == 'D') {
-      debugKeys = !debugKeys;
-
-      Serial.printf(
-        "[DEBUG] %s\n",
-        debugKeys ? "ON" : "OFF"
-      );
-    }
-
-    // NUEVO: cambiar la velocidad en vivo.
-    if (c == '1' || c == '2' || c == '3') {
-      hidGapMs =
-        (c == '1') ? 20 :
-        (c == '2') ? 12 : 8;
-
-      Serial.printf(
-        "[HID] Separacion: %u ms\n",
-        (unsigned)hidGapMs
-      );
-    }
-
-    if (c == 'e' || c == 'E') {
-      if (txBlocked) {
-        Serial.println(
-          "[TX] Bloqueado por error."
-        );
-      }
-      else if (txState != TX_IDLE) {
-        Serial.println(
-          "[TX] Otra orden PS/2 en curso."
-        );
-      }
-      else {
-        echoRequested = true;
-
-        Serial.println(
-          "[TX] ECHO solicitado."
-        );
-      }
-    }
-
-    if (c == 'l' || c == 'L') {
-      if (
-        !echoPassed ||
-        txBlocked ||
-        txState != TX_IDLE
-      ) {
-        Serial.println(
-          "[LED] ECHO requerido o bus ocupado."
-        );
-      }
-      else {
-        requestedLED = readHostLEDs();
-        ledRequested = true;
-
-        Serial.printf(
-          "[LED] Solicitud manual: 0x%02X\n",
-          requestedLED
-        );
-      }
-    }
-
-    if (c == 'a' || c == 'A') {
-      if (txBlocked) {
-        Serial.println(
-          "[LED] TX bloqueado."
-        );
-      }
-      else {
-        autoLED = !autoLED;
-        lastLEDChangeMs = millis();
-
-        if (autoLED && echoPassed) {
-          requestedLED = readHostLEDs();
-          ledRequested = true;
-        }
-
-        Serial.printf(
-          "[AUTO] LEDs automaticos: %s\n",
-          autoLED ? "ON" : "OFF"
-        );
-      }
-    }
-  }
-
-  static uint32_t lastStats = 0;
-
-  if ((uint32_t)(
-    millis() - lastStats
-  ) > 10000) {
-    lastStats = millis();
-    printStats();
+  if (watchdogEnabled) {
+    esp_task_wdt_reset();
   }
 
   delay(1);
