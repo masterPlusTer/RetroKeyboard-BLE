@@ -22,7 +22,7 @@ The design targets the **PS/2 protocol**, not a particular Chicony chip. Other P
 - [Build and upload](#build-and-upload)
 - [Testing and platform behavior](#testing-and-platform-behavior)
 - [Serial diagnostics](#serial-diagnostics)
-- [Photo gallery](#photo-gallery)
+- [Security considerations](#security-considerations)
 - [Compatibility, limitations, and safety](#compatibility-limitations-and-safety)
 - [Next steps](#next-steps)
 
