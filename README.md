@@ -265,6 +265,32 @@ IP5306 power module rear <img width="400" height="300" alt="image" src="https://
 
 Blue 14500 cell label 500mAh <img width="400" height="300" alt="image" src="https://github.com/user-attachments/assets/6eb2c679-b43f-427c-a4d5-1ec7105e4031" />
 
+## Security considerations
+
+This is an experimental DIY Bluetooth keyboard, **not a security-audited input device**. Preserving the original HP PS/2 controller does **not** independently protect keystrokes against interception or unauthorized wireless pairing. The original controller scans the keys and produces PS/2 scan codes; the ESP32-C3 firmware and BLE stack are responsible for wireless communication and its security properties.
+
+### BLE pairing and encryption
+
+- The project uses **HijelHID_BLEKeyboard** and **NimBLE-Arduino**. Their available security features do not by themselves prove which protections are active in a particular build or connection.
+- **Pairing method, bonding behavior, encrypted-link status and authenticated/MITM-protected pairing have not been independently verified on the published `v1.ino` build.** Do not assume that seeing the keyboard connected means the link is authenticated or resistant to active attacks.
+- Some BLE HID implementations use **Just Works** pairing. This method can establish an encrypted connection but does **not** provide protection against an active man-in-the-middle attacker during initial pairing. Verify the actual library settings and host behavior before making a security claim.
+- Pair in a trusted environment, review the list of paired devices on the host, and remove unexpected or obsolete pairings. A future revision should investigate restricting when new pairing is accepted, authenticated pairing where supported, and documenting verified BLE security settings.
+
+### Keystroke privacy and physical access
+
+- The original PS/2 connection and the ESP32 wiring are **not encrypted**; someone with physical access to the exposed electronics may be able to monitor the lines. This is normal for an internal keyboard interface and separate from BLE link security.
+- The firmware includes optional **Serial debugging of key activity**. Leave key-event debug disabled during normal use; do not capture or publish debug logs while typing passwords or other sensitive information. Physical USB/serial access to the ESP32 must also be considered.
+- This prototype does not intentionally implement cloud transmission or remote keystroke logging. That is a design description, **not** a guarantee against vulnerabilities in firmware, dependencies or a compromised computer.
+- No penetration testing, over-the-air BLE traffic validation or comprehensive source-code security audit has been completed. Use an independently trusted keyboard for especially sensitive authentication until these checks have been performed.
+
+### Recommended validation before claiming secure operation
+
+1. Check the **exact versions** of the BLE keyboard library, NimBLE-Arduino and ESP32 core used to build `v1.ino`.
+2. Confirm the selected **pairing mode**, bonding settings and whether a connection is actually **encrypted** on Windows and macOS.
+3. Test whether an **unknown host** can pair unexpectedly while the keyboard is in normal operation.
+4. Confirm that debug output does not expose keystrokes in normal operation and document the procedure for clearing stored bonds.
+5. Record the results in this README; until then, treat BLE security behavior as **not fully verified**.
+
 
 ## Compatibility, limitations, and safety
 
@@ -309,5 +335,6 @@ A keyboard with a functioning key mechanism, a perfectly usable key matrix and a
 
 **Prototype:** HP KB-9970 + ESP32-C3 SuperMini + experimental 1S Li-ion/IP5306 power source.  
 **Initial public firmware:** `v1.ino` (8 ms HID + watchdog + experimental CPU keep-alive).  
-**Last README update:** 8 November 2026.  
-
+**Last README update:** 9 November 2026.
+**WARNING:** I used IA to vibe code and get help with the circuits and such.  
+**License:** Open source.
