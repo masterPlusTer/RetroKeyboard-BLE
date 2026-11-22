@@ -98,6 +98,9 @@ The consumption conclusion above is an observation from this build. A reproducib
 
 ## Why I am keeping the recycled power-bank board
 
+<img width="1298" height="375" alt="image" src="https://github.com/user-attachments/assets/47325f2e-72d3-41a5-8abb-ce55735ee876" />
+
+
 This keyboard uses a **recycled IP5306-based power-bank board**. I have decided to keep that board in this particular assembly. Reusing it is part of the project, and the firmware needs to accommodate the hardware that is actually installed.
 
 Its inconvenient feature is low-load shutdown: the board can turn off its output when the keyboard draws too little current. The IP5306 documentation describes this type of load-detection behavior, but the exact behavior of a recycled board should be checked on the actual hardware.[^ip5306]
