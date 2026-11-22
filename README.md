@@ -55,7 +55,7 @@ The daylight photograph at the top shows the original beige enclosure and full-s
 
 ### The whole keyboard glowing
 
-<img width="800" height="600" alt="Teclado girado 180 grados-2" src="https://github.com/user-attachments/assets/5460f5fb-392b-45db-808f-b2714e2773a9" />
+<img width="800" height="600" alt="a39bcc0c-d0b7-4075-9bd5-abd17f05ed30" src="https://github.com/user-attachments/assets/b9ae248f-b314-4c9e-bd05-0351ce3b9763" />
 
 
 *A wider view in the dark, showing the green labels across the typing area, function row, navigation keys and numeric keypad, together with the glowing trim.*
@@ -64,7 +64,8 @@ The glow comes from **glow-in-the-dark adhesive stickers**, which I bought on Te
 
 ### A closer look at the labels
 
-<img width="800" height="600" alt="Teclado retroiluminado rotado 180 grados-1" src="https://github.com/user-attachments/assets/92589fe4-e768-46d6-8f33-c1d1a21b9ac7" />
+<img width="800" height="600" alt="0c56d354-bc91-440f-b5e4-6651c0f4c1a9" src="https://github.com/user-attachments/assets/6edbf14a-6d6f-4e3f-bf85-a344a151100a" />
+
 
 *The close-up shows the dark lettering against the green glow, with matching labels on the larger keys and a long strip on the space bar.*
 
