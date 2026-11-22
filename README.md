@@ -52,7 +52,7 @@ The daylight photograph at the top shows the original beige enclosure and full-s
 
 ### The whole keyboard glowing
 
-![Wide view of the HP KB-9970 with green glow-in-the-dark key labels and trim](assets/images/hp-kb9970-glow-overview.jpeg)
+<img width="800" height="600" alt="Teclado retroiluminado rotado 180 grados-1" src="https://github.com/user-attachments/assets/05f931d6-8b85-4fc9-bcf9-048adac17e64" />
 
 *A wider view in the dark, showing the green labels across the typing area, function row, navigation keys and numeric keypad, together with the glowing trim.*
 
@@ -60,7 +60,7 @@ The glow comes from **glow-in-the-dark adhesive stickers**, which I bought on Te
 
 ### A closer look at the labels
 
-![Close-up of glowing green key stickers, dark lettering and the space-bar strip](assets/images/hp-kb9970-glow-detail.jpeg)
+<img width="800" height="600" alt="Teclado retroiluminado rotado 180 grados-1" src="https://github.com/user-attachments/assets/92589fe4-e768-46d6-8f33-c1d1a21b9ac7" />
 
 *The close-up shows the dark lettering against the green glow, with matching labels on the larger keys and a long strip on the space bar.*
 
