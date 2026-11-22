@@ -34,6 +34,9 @@ I like this keyboard because it is solid, full-size, and still useful. Its origi
 
 The large enclosure also has a practical advantage: **there is useful space inside for the conversion electronics and a suitable battery installation**. I do not have to squeeze the whole project into an enclosure designed around two tiny disposable cells. That gives this build room to evolve, provided the battery and wiring are properly secured and the power circuit matches the chosen cell.
 
+<img width="1536" height="1152" alt="image" src="https://github.com/user-attachments/assets/c73d8fe3-9e5e-479a-86df-f8afbc074fe4" />
+
+
 Making it wireless removes the cable from everyday use. Adding web updates removes the need to open it for every firmware change. That combination is my idea of a **super keyboard**: a familiar, substantial keyboard that I can repair, adapt and keep improving.
 
 <details>
