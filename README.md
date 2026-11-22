@@ -134,7 +134,8 @@ More usable battery energy can increase runtime at the same average load, but en
 
 ### Inside the enclosure
 
-![Open HP keyboard enclosure showing three blue cylindrical cells, the power-board assembly, USB cabling, an edge-mounted switch and the ESP32-C3 board](assets/images/hp-kb9970-inside.jpeg)
+<img width="800" height="600" alt="hp-kb9970-inside" src="https://github.com/user-attachments/assets/2c0b7e4c-f265-4f6d-9efe-be043c9f953d" />
+
 
 *The internal assembly uses space along the upper part of the original enclosure. Three blue cylindrical cells are visible, together with the recycled power-board assembly, USB connections, wiring, the ESP32-C3 board and the switch at the upper edge.*
 
