@@ -1,9 +1,7 @@
 # HP KB-9970: PS/2 to Bluetooth LE, with web OTA
 
 **A solid old keyboard, a modern wireless connection, and firmware that can now be updated without opening the case.**
-<img width="600" height="400" alt="image" src="https://github.com/user-attachments/assets/76b59a49-3e16-4386-a9e0-776fe2694de1" />
-
-<img width="600" height="400" alt="hp-kb9970-daylight" src="https://github.com/user-attachments/assets/2189ba1a-6269-442c-8509-c7b766457580" />
+<img width="600" height="400" alt="image" src="https://github.com/user-attachments/assets/76b59a49-3e16-4386-a9e0-776fe2694de1" /><img width="600" height="400" alt="hp-kb9970-daylight" src="https://github.com/user-attachments/assets/2189ba1a-6269-442c-8509-c7b766457580" />
 
 *The assembled keyboard in daylight: the original full-size layout and enclosure, with a personal finish that makes the conversion my own.*
 
