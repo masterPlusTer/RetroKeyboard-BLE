@@ -2,7 +2,7 @@
 
 **A solid old keyboard, a modern wireless connection, and firmware that can now be updated without opening the case.**
 
-![Customized HP KB-9970 in daylight, with large key labels, warning-strip decoration and computing-themed stickers](assets/images/hp-kb9970-daylight.jpeg)
+<img width="800" height="600" alt="hp-kb9970-daylight" src="https://github.com/user-attachments/assets/2189ba1a-6269-442c-8509-c7b766457580" />
 
 *The assembled keyboard in daylight: the original full-size layout and enclosure, with a personal finish that makes the conversion my own.*
 
