@@ -52,7 +52,8 @@ The daylight photograph at the top shows the original beige enclosure and full-s
 
 ### The whole keyboard glowing
 
-<img width="800" height="600" alt="Teclado retroiluminado rotado 180 grados-1" src="https://github.com/user-attachments/assets/05f931d6-8b85-4fc9-bcf9-048adac17e64" />
+<img width="800" height="600" alt="Teclado girado 180 grados-2" src="https://github.com/user-attachments/assets/5460f5fb-392b-45db-808f-b2714e2773a9" />
+
 
 *A wider view in the dark, showing the green labels across the typing area, function row, navigation keys and numeric keypad, together with the glowing trim.*
 
